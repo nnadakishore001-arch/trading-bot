@@ -1,11 +1,12 @@
-import pandas as pd
 import requests
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from SmartApi import SmartConnect
 import pyotp
+import numpy as np
 
 # ===== TELEGRAM =====
-TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
+TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
 CHAT_ID = "890425913"
 
 def send(msg):
@@ -22,178 +23,174 @@ totp = pyotp.TOTP(TOTP_SECRET).now()
 obj = SmartConnect(api_key=API_KEY)
 obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-send("🚀 Starting FULL F&O Backtest...")
+import requests, time, pyotp, numpy as np
+from datetime import datetime
+from SmartApi import SmartConnect
 
-# ===== F&O STOCKS =====
+# ========= TELEGRAM =========
+TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
+CHAT_ID = "890425913"
+
+def send(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+
+# ========= LOGIN =========
+API_KEY = "VYFnGUA8"
+CLIENT_ID = "M373866"
+PASSWORD = "0917"
+TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
+
+def login():
+    obj = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    obj.generateSession(CLIENT_ID, PASSWORD, totp)
+    return obj
+
+# ========= F&O SECTORS =========
 SECTORS = {
-    "BANK": {"HDFCBANK": "1333","ICICIBANK": "4963","SBIN": "3045"},
-    "IT": {"TCS": "11536","INFY": "1594","HCLTECH": "7229"},
-    "AUTO": {"TATAMOTORS": "3456","MARUTI": "10999"},
-    "PHARMA": {"SUNPHARMA": "3351","CIPLA": "694","DRREDDY": "881"},
-    "ENERGY": {"RELIANCE": "2885","ONGC": "2475"}
+    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900"},
+    "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229"},
+    "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999"},
+    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694"},
+    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630"},
 }
 
-# ===== DATE RANGE (5 MONTHS) =====
-end_date = datetime.now()
-start_date = end_date - timedelta(days=150)
-
-# ===== FETCH DATA =====
-def get_data(token):
+# ========= DATA =========
+def get_candles(client, token):
+    now = datetime.now()
     params = {
-        "exchange": "NSE",
-        "symboltoken": token,
-        "interval": "FIVE_MINUTE",
-        "fromdate": start_date.strftime("%Y-%m-%d 09:15"),
-        "todate": end_date.strftime("%Y-%m-%d 15:30")
+        "exchange":"NSE",
+        "symboltoken":token,
+        "interval":"FIVE_MINUTE",
+        "fromdate":now.strftime("%Y-%m-%d 09:15"),
+        "todate":now.strftime("%Y-%m-%d 09:35")
     }
+    data = client.getCandleData(params)
+    return data["data"] if data["data"] else []
 
-    data = obj.getCandleData(params)
+# ========= INDICATORS =========
+def rsi(closes):
+    diff = np.diff(closes)
+    gain = np.mean([x for x in diff if x > 0] or [0])
+    loss = np.mean([-x for x in diff if x < 0] or [1])
+    rs = gain / loss if loss else 1
+    return 100 - (100 / (1 + rs))
 
-    if not data['data']:
-        return pd.DataFrame()
+def adx(candles):
+    closes = [x[4] for x in candles]
+    return min(np.std(closes) * 10, 50)
 
-    df = pd.DataFrame(data['data'], columns=["time","open","high","low","close","volume"])
-    df['time'] = pd.to_datetime(df['time'])
-    df['date'] = df['time'].dt.date
-    return df
+def vwap(c):
+    pv, vol = 0, 0
+    for i in c:
+        tp = (i[2] + i[3] + i[4]) / 3
+        pv += tp * i[5]
+        vol += i[5]
+    return pv / vol if vol else 0
 
-# ===== LOAD DATA =====
-market_data = {}
+def atr(c):
+    tr = []
+    for i in range(1, len(c)):
+        tr.append(max(c[i][2] - c[i][3], abs(c[i][2] - c[i-1][4])))
+    return np.mean(tr) if tr else 0
 
-for sector, stocks in SECTORS.items():
-    for sym, token in stocks.items():
-        try:
-            df = get_data(token)
-            if not df.empty:
-                market_data[sym] = {"sector": sector, "df": df}
-        except:
-            pass
-
-send(f"✅ Loaded {len(market_data)} F&O Stocks")
-
-# ===== BACKTEST =====
-results = []
-
-all_dates = sorted(set(
-    d for v in market_data.values()
-    for d in v["df"]["date"]
-))
-
-for day in all_dates:
+# ========= CORE =========
+def run(client):
 
     sector_strength = {}
-    stock_moves = []
+    pool = []
 
-    for sym, data in market_data.items():
+    # ----- Build Data -----
+    for sec, stocks in SECTORS.items():
+        changes = []
 
-        df = data["df"]
-        sector = data["sector"]
+        for sym, tok in stocks.items():
+            candles = get_candles(client, tok)
+            if len(candles) < 3:
+                continue
 
-        day_df = df[df['date'] == day]
+            open_p = candles[0][1]
+            ltp = candles[-1][4]
 
-        if day_df.empty:
-            continue
+            change = ((ltp - open_p) / open_p) * 100
+            changes.append(change)
 
-        open_915 = day_df[day_df['time'].dt.strftime("%H:%M") == "09:15"]
-        candle_930 = day_df[day_df['time'].dt.strftime("%H:%M") == "09:30"]
+            closes = [x[4] for x in candles]
 
-        if open_915.empty or candle_930.empty:
-            continue
+            pool.append({
+                "sym": sym,
+                "sector": sec,
+                "ltp": ltp,
+                "change": change,
+                "rsi": rsi(closes),
+                "adx": adx(candles),
+                "vwap": vwap(candles),
+                "atr": atr(candles)
+            })
 
-        open_price = open_915.iloc[0]['open']
-        price_930 = candle_930.iloc[0]['close']
+        if changes:
+            sector_strength[sec] = sum(changes) / len(changes)
 
-        change = ((price_930 - open_price) / open_price) * 100
+    # ----- Scoring System -----
+    signals = []
 
-        # include BUY + SELL both
-        if abs(change) > 0.8:
-            stock_moves.append((sym, sector, change, price_930))
+    for s in pool:
+        sec_str = sector_strength.get(s["sector"], 0)
+        direction = "BUY" if s["change"] > 0 else "SELL"
 
-        sector_strength.setdefault(sector, []).append(change)
+        score = 0
 
-    # ===== SECTOR STRENGTH =====
-    sector_strength = {k: sum(v)/len(v) for k, v in sector_strength.items() if v}
+        if abs(sec_str) > 0.7: score += 1
+        if abs(s["change"]) > 1: score += 1
+        if s["adx"] > 20: score += 1
 
-    strong_sectors = {k: v for k, v in sector_strength.items() if abs(v) > 0.5}
+        if direction == "BUY" and s["ltp"] > s["vwap"] and s["rsi"] > 55:
+            score += 1
+        if direction == "SELL" and s["ltp"] < s["vwap"] and s["rsi"] < 45:
+            score += 1
 
-    filtered = [
-        (sym, sec, chg, price)
-        for sym, sec, chg, price in stock_moves
-        if sec in strong_sectors
-    ]
+        if score >= 4:
+            signals.append((s, sec_str, direction, score))
 
-    if not filtered:
-        continue
+    # ----- Pick Top 2 ONLY -----
+    signals.sort(key=lambda x: x[3], reverse=True)
+    final = signals[:2]
 
-    filtered.sort(key=lambda x: abs(x[2]), reverse=True)
-    top_stocks = filtered[:2]
+    # ----- SEND OUTPUT -----
+    for s, sec_str, direction, score in final:
 
-    # ===== EXIT =====
-    for sym, sec, chg, entry in top_stocks:
+        ltp = s["ltp"]
+        risk = s["atr"]
 
-        df = market_data[sym]["df"]
-        day_df = df[df['date'] == day]
-
-        exit_candle = day_df[day_df['time'].dt.strftime("%H:%M") == "15:15"]
-
-        if exit_candle.empty:
-            continue
-
-        exit_price = exit_candle.iloc[0]['close']
-
-        # SELL logic handled here
-        if chg > 0:
-            pnl = ((exit_price - entry) / entry) * 100
-            direction = "🚀 BUY"
+        if direction == "BUY":
+            sl = ltp - risk
+            tp1 = ltp + risk * 1.5
+            tp2 = ltp + risk * 3
         else:
-            pnl = ((entry - exit_price) / entry) * 100
-            direction = "🔻 SELL"
+            sl = ltp + risk
+            tp1 = ltp - risk * 1.5
+            tp2 = ltp - risk * 3
 
-        results.append({
-            "date": day,
-            "stock": sym,
-            "sector": sec,
-            "direction": direction,
-            "pnl%": pnl
-        })
+        msg = f"""
+{direction} {s['sym']} [A+]
+Sector: {s['sector']} ({round(sec_str,2)}%)
 
-df_results = pd.DataFrame(results)
+Entry  : ₹{round(ltp,2)}
+SL     : ₹{round(sl,2)}
+TP1    : ₹{round(tp1,2)}  (1:1.5)
+TP2    : ₹{round(tp2,2)}  (1:3)
 
-# ===== SUMMARY =====
-summary = f"""
-📊 BACKTEST RESULT (5 Months)
-
-Total Trades: {len(df_results)}
-Win Rate: {round((df_results['pnl%'] > 0).mean()*100, 2)}%
-Avg Return: {round(df_results['pnl%'].mean(), 2)}%
+RSI: {round(s['rsi'],2)}  |  ADX: {round(s['adx'],2)}
+Time: {datetime.now().strftime("%H:%M")} IST
 """
-send(summary)
+        send(msg)
 
-# ===== TOP TRADES =====
-top_trades = df_results.sort_values(by="pnl%", ascending=False).head(5)
+# ========= RUN AT 9:30 =========
+client = login()
 
-msg = "🔥 Top Trades\n\n"
-for _, row in top_trades.iterrows():
-    msg += f"{row['stock']} | {row['date']} | {round(row['pnl%'],2)}%\n"
-
-send(msg)
-
-# ===== DAILY REPORT =====
-daily_msg = "📅 DAILY TRADE LOG (F&O)\n\n"
-
-for day, trades in df_results.groupby("date"):
-
-    daily_msg += f"\n📆 {day}\n"
-
-    for _, row in trades.iterrows():
-        daily_msg += (
-            f"{row['direction']} {row['stock']} ({row['sector']})\n"
-            f"P&L: {round(row['pnl%'],2)}%\n\n"
-        )
-
-    if len(daily_msg) > 3500:
-        send(daily_msg)
-        daily_msg = ""
-
-if daily_msg:
-    send(daily_msg)
+while True:
+    if datetime.now().strftime("%H:%M") >= "09:30":
+        run(client)
+        break
+    time.sleep(5)
