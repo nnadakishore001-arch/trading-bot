@@ -6,7 +6,7 @@ import pyotp
 
 # ===== TELEGRAM =====
 TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
-CHAT_ID = "554695395"
+CHAT_ID = "890425913"
 
 def send(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -22,13 +22,72 @@ totp = pyotp.TOTP(TOTP_SECRET).now()
 obj = SmartConnect(api_key=API_KEY)
 obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-send("🚀 Starting 5-Month Backtest...")
+send("🚀 Starting FULL F&O Backtest...")
 
-# ===== F&O STOCKS =====
+# ===== FULL F&O STOCK LIST (SECTOR-WISE) =====
 SECTORS = {
-    "BANK": {"HDFCBANK": "1333", "ICICIBANK": "4963", "SBIN": "3045"},
-    "IT": {"TCS": "11536", "INFY": "1594", "HCLTECH": "7229"},
-    "AUTO": {"TATAMOTORS": "3456", "MARUTI": "10999"},
+
+    "BANK": {
+        "HDFCBANK": "1333",
+        "ICICIBANK": "4963",
+        "SBIN": "3045",
+        "AXISBANK": "5900",
+        "KOTAKBANK": "1922"
+    },
+
+    "IT": {
+        "TCS": "11536",
+        "INFY": "1594",
+        "HCLTECH": "7229",
+        "TECHM": "13538",
+        "WIPRO": "3787"
+    },
+
+    "AUTO": {
+        "TATAMOTORS": "3456",
+        "MARUTI": "10999",
+        "M&M": "2031",
+        "BAJAJ-AUTO": "16669",
+        "EICHERMOT": "910"
+    },
+
+    "FMCG": {
+        "ITC": "1660",
+        "HINDUNILVR": "1394",
+        "NESTLEIND": "17963",
+        "DABUR": "772"
+    },
+
+    "PHARMA": {
+        "SUNPHARMA": "3351",
+        "DRREDDY": "881",
+        "CIPLA": "694",
+        "DIVISLAB": "10940"
+    },
+
+    "METAL": {
+        "TATASTEEL": "3499",
+        "JSWSTEEL": "11723",
+        "HINDALCO": "1363"
+    },
+
+    "ENERGY": {
+        "RELIANCE": "2885",
+        "ONGC": "2475",
+        "NTPC": "11630",
+        "POWERGRID": "14977"
+    },
+
+    "NBFC": {
+        "BAJFINANCE": "317",
+        "BAJAJFINSV": "16675",
+        "SBICARD": "17971"
+    },
+
+    "INFRA": {
+        "L&T": "11483",
+        "ADANIPORTS": "15083"
+    }
 }
 
 # ===== DATE RANGE =====
@@ -65,6 +124,8 @@ for sector, stocks in SECTORS.items():
                 market_data[sym] = {"sector": sector, "df": df}
         except:
             pass
+
+send(f"✅ Loaded {len(market_data)} F&O Stocks")
 
 # ===== BACKTEST =====
 results = []
@@ -103,10 +164,7 @@ for day in all_dates:
 
         stock_moves.append((sym, sector, change, price_930))
 
-        if sector not in sector_strength:
-            sector_strength[sector] = []
-
-        sector_strength[sector].append(change)
+        sector_strength.setdefault(sector, []).append(change)
 
     sector_strength = {k: sum(v)/len(v) for k, v in sector_strength.items() if v}
     strong_sectors = {k: v for k, v in sector_strength.items() if v > 0.5}
@@ -123,10 +181,8 @@ for day in all_dates:
     filtered.sort(key=lambda x: x[2], reverse=True)
     top_stocks = filtered[:2]
 
-    # ===== SAVE DAILY PICKS =====
     daily_picks[day] = top_stocks
 
-    # ===== EXIT =====
     for sym, sec, chg, entry in top_stocks:
 
         df = market_data[sym]["df"]
@@ -138,7 +194,6 @@ for day in all_dates:
             continue
 
         exit_price = exit_candle.iloc[0]['close']
-
         pnl = ((exit_price - entry) / entry) * 100
 
         results.append({
@@ -150,7 +205,7 @@ for day in all_dates:
 
 df_results = pd.DataFrame(results)
 
-# ===== SEND SUMMARY =====
+# ===== TELEGRAM OUTPUT =====
 summary = f"""
 📊 BACKTEST RESULT (5 Months)
 
@@ -160,22 +215,10 @@ Avg Return: {round(df_results['pnl%'].mean(), 2)}%
 """
 send(summary)
 
-# ===== SEND TOP TRADES =====
 top_trades = df_results.sort_values(by="pnl%", ascending=False).head(5)
 
 msg = "🔥 Top Trades\n\n"
 for _, row in top_trades.iterrows():
     msg += f"{row['stock']} | {row['date']} | {round(row['pnl%'],2)}%\n"
-
-send(msg)
-
-# ===== SEND DAILY PICKS =====
-msg = "📅 DAILY PICKS (2 Stocks Each Day)\n\n"
-
-for day, picks in list(daily_picks.items())[:10]:  # limit to avoid spam
-    msg += f"{day}:\n"
-    for sym, sec, chg, price in picks:
-        msg += f"  {sym} ({sec}) +{round(chg,2)}%\n"
-    msg += "\n"
 
 send(msg)
