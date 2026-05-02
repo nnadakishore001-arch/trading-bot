@@ -17,55 +17,54 @@ def send(msg):
     except Exception as e:
         print("Telegram Error:", e)
 
-# ===== LOGIN =====
+# ===== LOGIN (RETRY SAFE) =====
 API_KEY = "VYFnGUA8"
 CLIENT_ID = "M373866"
 PASSWORD = "0917"
 TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
 def login():
-    obj = SmartConnect(api_key=API_KEY)
+    for i in range(3):
+        try:
+            obj = SmartConnect(api_key=API_KEY)
+            totp = pyotp.TOTP(TOTP_SECRET).now()
 
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+            data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-    if not data['status']:
-        raise Exception("Login Failed")
+            if data['status']:
+                obj.setAccessToken(data['data']['jwtToken'])
+                print("✅ Login Success")
+                return obj
 
-    obj.setAccessToken(data['data']['jwtToken'])
+        except Exception as e:
+            print("Login retry...", e)
+            time.sleep(2)
 
-    return obj
+    raise Exception("Login Failed")
 
 obj = login()
-send("🚀 UPDATED BACKTEST STARTED")
+send("🚀 BACKTEST STARTED")
 
 # ===== DATE RANGE =====
-start = datetime(2026, 2, 1)
-end = datetime(2026, 4, 30)
+start = datetime(2025, 2, 1)
+end = datetime(2025, 4, 30)
 
-# ===== YOUR SECTORS =====
+# ===== SAFE STOCK SET (AVOID RATE LIMIT) =====
 SECTORS = {
-    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
-    "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
-    "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669"},
-    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694","DRREDDY":"881","DIVISLAB":"10940"},
-    "FMCG": {"ITC":"1660","HINDUNILVR":"1394","NESTLEIND":"17963"},
-    "METAL": {"TATASTEEL":"3499","JSWSTEEL":"11723","HINDALCO":"1363"},
-    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630","POWERGRID":"14977"},
-    "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
-    "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
+    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963"},
+    "IT": {"TCS":"11536","INFY":"1594"},
+    "ENERGY": {"RELIANCE":"2885"}
 }
 
 # ================= DATA =================
 def get_data(token):
-
     global obj
 
     all_data = []
     current = start
 
     while current < end:
-        nxt = current + timedelta(days=5)
+        nxt = current + timedelta(days=3)
 
         retry = 0
         success = False
@@ -80,7 +79,7 @@ def get_data(token):
                     "todate": nxt.strftime("%Y-%m-%d 15:30")
                 })
 
-                # 🔴 TOKEN EXPIRED
+                # Token expired → re-login
                 if res and res.get("errorCode") == "AG8001":
                     print("🔁 Token expired → Re-login")
                     obj = login()
@@ -96,12 +95,13 @@ def get_data(token):
             except Exception as e:
                 print("API Error:", e)
                 retry += 1
+                time.sleep(1)
 
         if not success:
-            print(f"⚠️ Skipping chunk: {current} → {nxt}")
+            print(f"⚠️ Skipping {current} → {nxt}")
 
         current = nxt
-        time.sleep(0.2)
+        time.sleep(0.6)   # 🔥 RATE LIMIT FIX
 
     if not all_data:
         return pd.DataFrame()
@@ -113,13 +113,11 @@ def get_data(token):
     return df
 
 # ================= LOAD =================
-print(f"Fetching {sym}...")
-
 market = {}
 
 for sec, stocks in SECTORS.items():
     for sym, tok in stocks.items():
-
+        print(f"Fetching {sym}...")
         df = get_data(tok)
 
         print(sym, "rows:", len(df))
@@ -141,75 +139,35 @@ dates = sorted(set(d for v in market.values() for d in v["df"]["date"]))
 
 for day in dates:
 
-    sector_strength = {}
     pool = []
 
     for sym, data in market.items():
 
         df = data["df"]
-        sec = data["sector"]
-
         day_df = df[df['date'] == day].sort_values("time")
 
         if len(day_df) < 6:
             continue
 
-        # ===== 9:30 =====
-        row = day_df.iloc[3]
-
+        # ===== 9:30 LOGIC =====
         open_p = day_df.iloc[0]['open']
-        ltp = row['close']
+        ltp = day_df.iloc[3]['close']
 
         change = ((ltp - open_p) / open_p) * 100
-
-        # ===== ORB =====
-        high_920 = day_df.iloc[:3]['high'].max()
-        low_920 = day_df.iloc[:3]['low'].min()
-        orb = ltp > high_920 or ltp < low_920
-
-        sector_strength.setdefault(sec, []).append(change)
 
         if abs(change) < 0.7:
             continue
 
-        pool.append({
-            "sym": sym,
-            "sector": sec,
-            "change": change,
-            "ltp": ltp,
-            "df": day_df,
-            "orb": orb
-        })
+        pool.append((sym, change, ltp, day_df))
 
     if not pool:
         continue
 
-    # ===== SECTOR AVG =====
-    sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
+    pool.sort(key=lambda x: abs(x[1]), reverse=True)
 
-    # ===== SCORING =====
-    scored = []
+    sym, change, entry, df = pool[0]
 
-    for s in pool:
-
-        sec_str = sector_strength.get(s["sector"], 0)
-
-        score = 0
-
-        if abs(s["change"]) > 1: score += 1
-        if s["orb"]: score += 1
-        if abs(sec_str) > 0.5: score += 1
-
-        scored.append((score, s))
-
-    # ===== PICK TOP 2 =====
-    scored.sort(key=lambda x: (x[0], abs(x[1]["change"])), reverse=True)
-    top2 = scored[:2]
-
-    final = top2[0][1]
-
-    direction = "BUY" if final["change"] > 0 else "SELL"
-    entry = final["ltp"]
+    direction = "BUY" if change > 0 else "SELL"
 
     sl = entry * 0.99 if direction == "BUY" else entry * 1.01
     tp = entry * 1.02 if direction == "BUY" else entry * 0.98
@@ -217,7 +175,7 @@ for day in dates:
     pnl = 0
     result = "NONE"
 
-    for _, row in final["df"].iterrows():
+    for _, row in df.iterrows():
 
         if direction == "BUY":
             if row['high'] >= tp:
@@ -231,7 +189,7 @@ for day in dates:
                 pnl = -1; result = "SL"; break
 
     results.append(pnl)
-    logs.append(f"{day} | {direction} {final['sym']} | {result} | {pnl}%")
+    logs.append(f"{day} | {direction} {sym} | {result} | {pnl}%")
 
 # ================= RESULT =================
 total = len(results)
@@ -240,7 +198,7 @@ winrate = (wins / total) * 100 if total else 0
 avg = np.mean(results) if results else 0
 
 msg = f"""
-📊 UPDATED BACKTEST RESULT
+📊 FINAL BACKTEST RESULT
 
 Trades: {total}
 Win Rate: {round(winrate,2)}%
@@ -250,4 +208,4 @@ Avg Return: {round(avg,2)}%
 print(msg)
 send(msg)
 
-send("🔥 SAMPLE TRADES:\n" + "\n".join(logs[:15]))
+send("🔥 SAMPLE TRADES:\n" + "\n".join(logs[:10]))
