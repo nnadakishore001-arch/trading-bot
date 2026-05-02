@@ -24,76 +24,20 @@ obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
 send("🚀 Starting FULL F&O Backtest...")
 
-# ===== FULL F&O STOCK LIST (SECTOR-WISE) =====
+# ===== F&O STOCKS =====
 SECTORS = {
-
-    "BANK": {
-        "HDFCBANK": "1333",
-        "ICICIBANK": "4963",
-        "SBIN": "3045",
-        "AXISBANK": "5900",
-        "KOTAKBANK": "1922"
-    },
-
-    "IT": {
-        "TCS": "11536",
-        "INFY": "1594",
-        "HCLTECH": "7229",
-        "TECHM": "13538",
-        "WIPRO": "3787"
-    },
-
-    "AUTO": {
-        "TATAMOTORS": "3456",
-        "MARUTI": "10999",
-        "M&M": "2031",
-        "BAJAJ-AUTO": "16669",
-        "EICHERMOT": "910"
-    },
-
-    "FMCG": {
-        "ITC": "1660",
-        "HINDUNILVR": "1394",
-        "NESTLEIND": "17963",
-        "DABUR": "772"
-    },
-
-    "PHARMA": {
-        "SUNPHARMA": "3351",
-        "DRREDDY": "881",
-        "CIPLA": "694",
-        "DIVISLAB": "10940"
-    },
-
-    "METAL": {
-        "TATASTEEL": "3499",
-        "JSWSTEEL": "11723",
-        "HINDALCO": "1363"
-    },
-
-    "ENERGY": {
-        "RELIANCE": "2885",
-        "ONGC": "2475",
-        "NTPC": "11630",
-        "POWERGRID": "14977"
-    },
-
-    "NBFC": {
-        "BAJFINANCE": "317",
-        "BAJAJFINSV": "16675",
-        "SBICARD": "17971"
-    },
-
-    "INFRA": {
-        "L&T": "11483",
-        "ADANIPORTS": "15083"
-    }
+    "BANK": {"HDFCBANK": "1333","ICICIBANK": "4963","SBIN": "3045"},
+    "IT": {"TCS": "11536","INFY": "1594","HCLTECH": "7229"},
+    "AUTO": {"TATAMOTORS": "3456","MARUTI": "10999"},
+    "PHARMA": {"SUNPHARMA": "3351","CIPLA": "694","DRREDDY": "881"},
+    "ENERGY": {"RELIANCE": "2885","ONGC": "2475"}
 }
 
-# ===== DATE RANGE =====
+# ===== DATE RANGE (5 MONTHS) =====
 end_date = datetime.now()
 start_date = end_date - timedelta(days=150)
 
+# ===== FETCH DATA =====
 def get_data(token):
     params = {
         "exchange": "NSE",
@@ -129,7 +73,6 @@ send(f"✅ Loaded {len(market_data)} F&O Stocks")
 
 # ===== BACKTEST =====
 results = []
-daily_picks = {}
 
 all_dates = sorted(set(
     d for v in market_data.values()
@@ -162,27 +105,30 @@ for day in all_dates:
 
         change = ((price_930 - open_price) / open_price) * 100
 
-        stock_moves.append((sym, sector, change, price_930))
+        # include BUY + SELL both
+        if abs(change) > 0.8:
+            stock_moves.append((sym, sector, change, price_930))
 
         sector_strength.setdefault(sector, []).append(change)
 
+    # ===== SECTOR STRENGTH =====
     sector_strength = {k: sum(v)/len(v) for k, v in sector_strength.items() if v}
-    strong_sectors = {k: v for k, v in sector_strength.items() if v > 0.5}
+
+    strong_sectors = {k: v for k, v in sector_strength.items() if abs(v) > 0.5}
 
     filtered = [
         (sym, sec, chg, price)
         for sym, sec, chg, price in stock_moves
-        if sec in strong_sectors and chg > 0.8
+        if sec in strong_sectors
     ]
 
     if not filtered:
         continue
 
-    filtered.sort(key=lambda x: x[2], reverse=True)
+    filtered.sort(key=lambda x: abs(x[2]), reverse=True)
     top_stocks = filtered[:2]
 
-    daily_picks[day] = top_stocks
-
+    # ===== EXIT =====
     for sym, sec, chg, entry in top_stocks:
 
         df = market_data[sym]["df"]
@@ -194,18 +140,26 @@ for day in all_dates:
             continue
 
         exit_price = exit_candle.iloc[0]['close']
-        pnl = ((exit_price - entry) / entry) * 100
+
+        # SELL logic handled here
+        if chg > 0:
+            pnl = ((exit_price - entry) / entry) * 100
+            direction = "🚀 BUY"
+        else:
+            pnl = ((entry - exit_price) / entry) * 100
+            direction = "🔻 SELL"
 
         results.append({
             "date": day,
             "stock": sym,
             "sector": sec,
+            "direction": direction,
             "pnl%": pnl
         })
 
 df_results = pd.DataFrame(results)
 
-# ===== TELEGRAM OUTPUT =====
+# ===== SUMMARY =====
 summary = f"""
 📊 BACKTEST RESULT (5 Months)
 
@@ -215,6 +169,7 @@ Avg Return: {round(df_results['pnl%'].mean(), 2)}%
 """
 send(summary)
 
+# ===== TOP TRADES =====
 top_trades = df_results.sort_values(by="pnl%", ascending=False).head(5)
 
 msg = "🔥 Top Trades\n\n"
@@ -222,3 +177,23 @@ for _, row in top_trades.iterrows():
     msg += f"{row['stock']} | {row['date']} | {round(row['pnl%'],2)}%\n"
 
 send(msg)
+
+# ===== DAILY REPORT =====
+daily_msg = "📅 DAILY TRADE LOG (F&O)\n\n"
+
+for day, trades in df_results.groupby("date"):
+
+    daily_msg += f"\n📆 {day}\n"
+
+    for _, row in trades.iterrows():
+        daily_msg += (
+            f"{row['direction']} {row['stock']} ({row['sector']})\n"
+            f"P&L: {round(row['pnl%'],2)}%\n\n"
+        )
+
+    if len(daily_msg) > 3500:
+        send(daily_msg)
+        daily_msg = ""
+
+if daily_msg:
+    send(daily_msg)
