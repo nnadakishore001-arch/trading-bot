@@ -27,36 +27,45 @@ session_time = None
 
 def login():
     global session_time
-    for _ in range(3):
+    for attempt in range(5):
         try:
+            print(f"Login attempt {attempt+1}")
+
             obj = SmartConnect(api_key=API_KEY)
             totp = pyotp.TOTP(TOTP_SECRET).now()
+
             data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-            if data.get("status"):
+            if data and data.get("status"):
                 obj.setAccessToken(data['data']['jwtToken'])
                 session_time = datetime.now()
-                print("Login Success")
+                print("✅ Login Success")
                 return obj
-        except:
-            time.sleep(3)
 
-    raise Exception("Login Failed")
+        except Exception as e:
+            print("Login error:", e)
+
+        time.sleep(10)
+
+    return None
 
 obj = login()
-send("🚀 BACKTEST STARTED (30 Days)")
+
+if obj is None:
+    send("❌ Login failed. Try after 10 mins.")
+    exit()
+
+send("🚀 BACKTEST STARTED\n⏳ Fetching market data...")
 
 # ========= LAST 30 DAYS =========
 today = datetime.now()
-
-# safety if server clock is wrong
 if today.year > 2025:
     today = datetime(2025, 4, 30)
 
 end = today
 start = end - timedelta(days=30)
 
-# ========= YOUR CONFIG =========
+# ========= CONFIG =========
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
@@ -87,6 +96,8 @@ def get_data(token):
         # refresh session every 5 mins
         if session_time and (datetime.now() - session_time).seconds > 300:
             obj = login()
+            if obj is None:
+                return pd.DataFrame()
 
         try:
             res = obj.getCandleData({
@@ -98,7 +109,7 @@ def get_data(token):
             })
 
             if res and res.get("errorCode") == "AG8001":
-                print("Token issue → wait + relogin")
+                print("Token issue → relogin")
                 time.sleep(6)
                 obj = login()
                 continue
@@ -110,8 +121,6 @@ def get_data(token):
             print("API error:", e)
 
         current = nxt
-
-        # 🔥 KEY FIX: slow calls
         time.sleep(2.2)
 
     if not all_data:
@@ -124,27 +133,41 @@ def get_data(token):
 
 # ========= LOAD =========
 market = {}
+total_stocks = sum(len(v) for v in SECTORS.values())
+count = 0
+
 for sec, stocks in SECTORS.items():
     for sym, tok in stocks.items():
-        print(f"Fetching {sym}")
+        count += 1
+        print(f"[{count}/{total_stocks}] Fetching {sym}")
+
+        if count % 5 == 0:
+            send(f"📡 Data Progress: {count}/{total_stocks}")
+
         df = get_data(tok)
+
         if not df.empty:
             market[sym] = {"df": df, "sector": sec}
 
+send(f"✅ Data Load Complete\nStocks: {len(market)}")
+
+# ========= INDEX LOAD =========
 index_data = {}
 for name, tok in INDICES.items():
     df = get_data(tok)
     if not df.empty:
         index_data[name] = df
 
-send(f"Loaded {len(market)} stocks")
-
 # ========= BACKTEST =========
 results = []
-
 dates = sorted(set(d for v in market.values() for d in v["df"]["date"]))
 
-for day in dates:
+send("⚙️ Running Backtest...")
+
+for i, day in enumerate(dates):
+
+    if i % 10 == 0:
+        send(f"📅 Progress: {i}/{len(dates)} days")
 
     try:
         n_df = index_data["NIFTY"]
@@ -153,10 +176,7 @@ for day in dates:
         if len(n_day) < 4:
             continue
 
-        n_open = n_day.iloc[0]['open']
-        n_930  = n_day.iloc[3]['close']
-        index_dir = 1 if n_930 > n_open else -1
-
+        index_dir = 1 if n_day.iloc[3]['close'] > n_day.iloc[0]['open'] else -1
     except:
         continue
 
@@ -164,12 +184,10 @@ for day in dates:
     pool = []
 
     for sym, data in market.items():
-
         df = data["df"]
         sec = data["sector"]
 
         day_df = df[df['date'] == day].sort_values("time")
-
         if len(day_df) < 6:
             continue
 
@@ -177,7 +195,6 @@ for day in dates:
         close_930 = day_df.iloc[3]['close']
 
         change = ((close_930 - open_p) / open_p) * 100
-
         sector_strength.setdefault(sec, []).append(change)
 
         pool.append((sym, sec, change, close_930, day_df))
@@ -208,7 +225,6 @@ for day in dates:
     sym, change, entry, df = signals[0]
 
     direction = "BUY" if change > 0 else "SELL"
-
     sl = entry * 0.99 if direction == "BUY" else entry * 1.01
     tp = entry * 1.02 if direction == "BUY" else entry * 0.98
 
@@ -234,7 +250,7 @@ wins = len([x for x in results if x > 0])
 winrate = (wins / total) * 100 if total else 0
 
 msg = f"""
-📊 BACKTEST RESULT (30 DAYS)
+📊 BACKTEST COMPLETE
 
 Trades: {total}
 Win Rate: {round(winrate,2)}%
