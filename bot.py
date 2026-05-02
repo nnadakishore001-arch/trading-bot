@@ -20,60 +20,132 @@ print("Login Success")
 # ===== TELEGRAM =====
 TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
 CHAT_ID = "890425913"
-
+# ===== TELEGRAM =====
 def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# ===== STOCKS =====
-TOKENS = {
-    "RELIANCE": "2885",
-    "TCS": "11536"
+# ===== LOGIN =====
+def login():
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    obj = SmartConnect(api_key=API_KEY)
+    obj.generateSession(CLIENT_ID, PASSWORD, totp)
+    return obj
+
+# ===== F&O STOCKS (BEST LIQUID STOCKS ONLY) =====
+SECTORS = {
+    "BANK": {
+        "HDFCBANK": "1333",
+        "ICICIBANK": "4963",
+        "SBIN": "3045",
+        "AXISBANK": "5900",
+        "KOTAKBANK": "1922"
+    },
+    "IT": {
+        "TCS": "11536",
+        "INFY": "1594",
+        "HCLTECH": "7229",
+        "WIPRO": "3787",
+        "TECHM": "13538"
+    },
+    "AUTO": {
+        "TATAMOTORS": "3456",
+        "MARUTI": "10999",
+        "M&M": "2031",
+        "BAJAJ-AUTO": "16669"
+    },
+    "FMCG": {
+        "ITC": "1660",
+        "HINDUNILVR": "1394",
+        "NESTLEIND": "17963"
+    },
+    "ENERGY": {
+        "RELIANCE": "2885",
+        "ONGC": "2475"
+    }
 }
 
-levels = {}
+# ===== GET PRICE CHANGE =====
+def get_change(obj, symbol, token):
+    data = obj.ltpData("NSE", symbol, token)['data']
+    ltp = data['ltp']
+    open_price = data['open']
+    change = ((ltp - open_price) / open_price) * 100
+    return ltp, change
 
-send("📊 Bot Started...")
+# ===== HEATMAP =====
+def format_heatmap(sector_data):
+    sorted_sec = sorted(sector_data.items(), key=lambda x: x[1], reverse=True)
 
-# ===== WAIT FOR 9:20 =====
-while True:
-    now = datetime.now().strftime("%H:%M")
-    if now >= "09:20":
-        break
-    time.sleep(5)
+    msg = "📊 Sector Heatmap\n\n"
 
-# ===== CAPTURE LEVELS =====
-for stock, token in TOKENS.items():
-    data = obj.ltpData("NSE", stock, token)
-    price = data['data']['ltp']
+    for sec, pct in sorted_sec:
+        bars = int(abs(pct) * 3)
 
-    levels[stock] = {
-        "high": price + 2,
-        "low": price - 2
-    }
+        if pct > 0:
+            bar = "🟢" * bars
+        else:
+            bar = "🔴" * bars
 
-send("✅ Levels Captured")
+        msg += f"{sec:<8} {pct:+.2f}%  {bar}\n"
 
-# ===== LIVE MONITOR =====
-while True:
-    for stock, token in TOKENS.items():
-        try:
-            ltp = obj.ltpData("NSE", stock, token)['data']['ltp']
+    return msg
 
-            high = levels[stock]["high"]
-            low = levels[stock]["low"]
+# ===== MAIN LOGIC =====
+def run_screener():
+    send("🚀 Running F&O Sector Screener...")
 
-            if ltp > high:
-                send(f"🚀 BUY {stock}\nAbove: {high}\nLTP: {ltp}")
-                levels.pop(stock)
+    obj = login()
 
-            elif ltp < low:
-                send(f"🔻 SELL {stock}\nBelow: {low}\nLTP: {ltp}")
-                levels.pop(stock)
+    sector_strength = {}
+    stock_data = []
 
-        except:
-            pass
+    for sector, stocks in SECTORS.items():
+        changes = []
 
-    time.sleep(5)
-    if __name__ == "__main__":
-    main()
+        for sym, tok in stocks.items():
+            try:
+                ltp, change = get_change(obj, sym, tok)
+
+                # 🔥 FILTER 1: Ignore weak moves
+                if abs(change) < 0.8:
+                    continue
+
+                changes.append(change)
+                stock_data.append((sym, tok, change, ltp, sector))
+
+            except:
+                pass
+
+        if changes:
+            sector_strength[sector] = sum(changes) / len(changes)
+
+    # ===== SEND HEATMAP =====
+    send(format_heatmap(sector_strength))
+
+    # ===== FILTER STRONG SECTOR STOCKS =====
+    filtered = []
+
+    for sym, tok, change, ltp, sector in stock_data:
+        if sector_strength.get(sector, 0) > 0.5:
+            filtered.append((sym, tok, change, ltp, sector))
+
+    # ===== PICK TOP 2 =====
+    filtered.sort(key=lambda x: x[2], reverse=True)
+    top_stocks = filtered[:2]
+
+    msg = "\n🔥 Top Picks (F&O)\n\n"
+
+    for sym, tok, change, ltp, sector in top_stocks:
+        direction = "BUY" if change > 0 else "SELL"
+
+        msg += f"{direction} {sym}\n"
+        msg += f"Sector: {sector}\n"
+        msg += f"LTP: {ltp}\n"
+        msg += f"Move: {change:.2f}%\n\n"
+
+    send(msg)
+
+# ===== RUN (INSTANT TEST) =====
+if __name__ == "__main__":
+    run_screener()
