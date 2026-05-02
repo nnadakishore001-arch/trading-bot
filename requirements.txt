@@ -8,3 +8,5 @@ apscheduler
 pytz
 loguru
 websocket-client
+numpy
+yfinance
