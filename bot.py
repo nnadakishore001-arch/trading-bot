@@ -75,5 +75,5 @@ while True:
             pass
 
     time.sleep(5)
-if __name__ == "__main__":
-    run_930_screener()
+    if __name__ == "__main__":
+    main()
