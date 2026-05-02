@@ -20,9 +20,9 @@ print("Login Success")
 # ===== TELEGRAM =====
 TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
 CHAT_ID = "890425913"
-# ===== TELEGRAM =====
+
 def send(msg):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"  # ✅ FIXED HERE
     requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
 # ===== LOGIN =====
@@ -32,7 +32,7 @@ def login():
     obj.generateSession(CLIENT_ID, PASSWORD, totp)
     return obj
 
-# ===== F&O STOCKS (BEST LIQUID STOCKS ONLY) =====
+# ===== F&O STOCKS =====
 SECTORS = {
     "BANK": {
         "HDFCBANK": "1333",
@@ -107,7 +107,6 @@ def run_screener():
             try:
                 ltp, change = get_change(obj, sym, tok)
 
-                # 🔥 FILTER 1: Ignore weak moves
                 if abs(change) < 0.8:
                     continue
 
@@ -120,17 +119,14 @@ def run_screener():
         if changes:
             sector_strength[sector] = sum(changes) / len(changes)
 
-    # ===== SEND HEATMAP =====
     send(format_heatmap(sector_strength))
 
-    # ===== FILTER STRONG SECTOR STOCKS =====
     filtered = []
 
     for sym, tok, change, ltp, sector in stock_data:
         if sector_strength.get(sector, 0) > 0.5:
             filtered.append((sym, tok, change, ltp, sector))
 
-    # ===== PICK TOP 2 =====
     filtered.sort(key=lambda x: x[2], reverse=True)
     top_stocks = filtered[:2]
 
@@ -146,6 +142,6 @@ def run_screener():
 
     send(msg)
 
-# ===== RUN (INSTANT TEST) =====
+# ===== RUN =====
 if __name__ == "__main__":
     run_screener()
