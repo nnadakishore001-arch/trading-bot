@@ -25,27 +25,23 @@ TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
 def login():
     obj = SmartConnect(api_key=API_KEY)
-
     totp = pyotp.TOTP(TOTP_SECRET).now()
     data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
     if not data['status']:
         raise Exception("Login Failed")
 
-    access_token = data['data']['jwtToken']
-    obj.setAccessToken(access_token)
-
-    print("Login Success")
+    obj.setAccessToken(data['data']['jwtToken'])
     return obj
 
 obj = login()
-send("🚀 FINAL BACKTEST STARTED")
+send("🚀 UPDATED BACKTEST STARTED")
 
-# ===== DATE (FIXED) =====
+# ===== DATE RANGE =====
 start = datetime(2025, 2, 1)
 end = datetime(2025, 4, 30)
 
-# ===== SECTORS =====
+# ===== YOUR SECTORS =====
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
@@ -82,7 +78,7 @@ def get_data(token):
             print("API Error:", e)
 
         current = nxt
-        time.sleep(0.2)
+        time.sleep(0.15)   # faster but safe
 
     if not all_data:
         return pd.DataFrame()
@@ -98,6 +94,7 @@ market = {}
 
 for sec, stocks in SECTORS.items():
     for sym, tok in stocks.items():
+
         df = get_data(tok)
 
         print(sym, "rows:", len(df))
@@ -132,14 +129,8 @@ for day in dates:
         if len(day_df) < 6:
             continue
 
-        # ===== ROBUST 9:30 LOGIC =====
-        day_df['t'] = day_df['time'].dt.strftime("%H:%M")
-        row_930 = day_df[day_df['t'] == "09:30"]
-
-        if row_930.empty:
-            row_930 = day_df.iloc[:6]
-
-        row = row_930.iloc[0]
+        # ===== 9:30 =====
+        row = day_df.iloc[3]
 
         open_p = day_df.iloc[0]['open']
         ltp = row['close']
@@ -168,24 +159,29 @@ for day in dates:
     if not pool:
         continue
 
-    # ===== SECTOR STRENGTH =====
+    # ===== SECTOR AVG =====
     sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
 
     # ===== SCORING =====
     scored = []
 
     for s in pool:
+
+        sec_str = sector_strength.get(s["sector"], 0)
+
         score = 0
 
         if abs(s["change"]) > 1: score += 1
         if s["orb"]: score += 1
-        if abs(sector_strength.get(s["sector"],0)) > 0.5: score += 1
+        if abs(sec_str) > 0.5: score += 1
 
         scored.append((score, s))
 
+    # ===== PICK TOP 2 =====
     scored.sort(key=lambda x: (x[0], abs(x[1]["change"])), reverse=True)
+    top2 = scored[:2]
 
-    final = scored[0][1]
+    final = top2[0][1]
 
     direction = "BUY" if final["change"] > 0 else "SELL"
     entry = final["ltp"]
@@ -203,7 +199,6 @@ for day in dates:
                 pnl = 2; result = "TP"; break
             elif row['low'] <= sl:
                 pnl = -1; result = "SL"; break
-
         else:
             if row['low'] <= tp:
                 pnl = 2; result = "TP"; break
@@ -220,7 +215,7 @@ winrate = (wins / total) * 100 if total else 0
 avg = np.mean(results) if results else 0
 
 msg = f"""
-📊 FINAL BACKTEST RESULT
+📊 UPDATED BACKTEST RESULT
 
 Trades: {total}
 Win Rate: {round(winrate,2)}%
