@@ -59,57 +59,87 @@ SECTORS = {
     "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
 }
-# ===== DATE RANGE =====
-end = datetime.now()
-start = end - timedelta(days=90)
-
 # ===== GET DATA =====
 def get_data(token):
-    params = {
-        "exchange":"NSE",
-        "symboltoken":token,
-        "interval":"FIVE_MINUTE",
-        "fromdate":start.strftime("%Y-%m-%d 09:15"),
-        "todate":end.strftime("%Y-%m-%d 15:30")
-    }
+    try:
+        params = {
+            "exchange": "NSE",
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": start.strftime("%Y-%m-%d 09:15"),
+            "todate": end.strftime("%Y-%m-%d 15:30")
+        }
 
-    data = obj.getCandleData(params)
+        data = obj.getCandleData(params)
 
-    if not data['data']:
+        if not data or 'data' not in data or data['data'] is None:
+            return pd.DataFrame()
+
+        if len(data['data']) == 0:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            data['data'],
+            columns=["time", "open", "high", "low", "close", "volume"]
+        )
+
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        df = df.dropna()
+        df['date'] = df['time'].dt.date
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Error fetching token {token}: {e}")
         return pd.DataFrame()
 
-    df = pd.DataFrame(data['data'],
-                      columns=["time","open","high","low","close","volume"])
-    df['time'] = pd.to_datetime(df['time'])
-    df['date'] = df['time'].dt.date
-    return df
+
+# ===== LOAD DATA =====
+market_data = {}
+
+for sec, stocks in SECTORS.items():
+    for sym, token in stocks.items():
+
+        df = get_data(token)
+
+        if df.empty:
+            print(f"⚠️ No data for {sym}")
+            continue
+
+        if len(df) < 50:
+            print(f"⚠️ Not enough data for {sym}")
+            continue
+
+        market_data[sym] = {
+            "sector": sec,
+            "df": df
+        }
+
+print(f"✅ Loaded {len(market_data)} stocks successfully")
+
 
 # ===== INDICATORS =====
 def rsi(close):
     diff = np.diff(close)
     gain = np.mean([x for x in diff if x > 0] or [0])
     loss = np.mean([-x for x in diff if x < 0] or [1])
-    rs = gain/loss if loss else 1
-    return 100 - (100/(1+rs))
+    rs = gain / loss if loss else 1
+    return 100 - (100 / (1 + rs))
+
 
 def adx(close):
-    return min(np.std(close)*10,50)
+    return min(np.std(close) * 10, 50)
+
 
 def atr(df):
-    tr=[]
-    for i in range(1,len(df)):
-        tr.append(max(df.iloc[i]['high']-df.iloc[i]['low'],
-                      abs(df.iloc[i]['high']-df.iloc[i-1]['close'])))
+    tr = []
+    for i in range(1, len(df)):
+        tr.append(max(
+            df.iloc[i]['high'] - df.iloc[i]['low'],
+            abs(df.iloc[i]['high'] - df.iloc[i-1]['close'])
+        ))
     return np.mean(tr) if tr else 0
 
-# ===== LOAD DATA =====
-market_data = {}
-
-for sec,stocks in SECTORS.items():
-    for sym,token in stocks.items():
-        df = get_data(token)
-        if not df.empty:
-            market_data[sym] = {"sector":sec,"df":df}
 
 # ===== BACKTEST =====
 results = []
@@ -121,97 +151,105 @@ dates = sorted(set(
 
 for day in dates:
 
-    sector_strength={}
-    pool=[]
+    sector_strength = {}
+    pool = []
 
-    for sym,data in market_data.items():
+    for sym, data in market_data.items():
 
-        df=data["df"]
-        sec=data["sector"]
+        df = data["df"]
+        sec = data["sector"]
 
-        day_df = df[df['date']==day]
+        day_df = df[df['date'] == day].copy()
 
-        if len(day_df)<4:
+        if day_df.empty or len(day_df) < 4:
             continue
 
         open_p = day_df.iloc[0]['open']
         ltp = day_df.iloc[3]['close']
 
-        change = ((ltp-open_p)/open_p)*100
+        change = ((ltp - open_p) / open_p) * 100
 
         closes = day_df['close'].values[:4]
 
-        # ORB
+        # ===== ORB =====
         high_920 = day_df.iloc[:2]['high'].max()
         low_920 = day_df.iloc[:2]['low'].min()
-
         breakout = ltp > high_920 or ltp < low_920
 
-        # volume
+        # ===== VOLUME =====
         vol_now = day_df.iloc[3]['volume']
         avg_vol = day_df.iloc[:3]['volume'].mean()
-
         volume_ok = vol_now > 1.5 * avg_vol
 
         pool.append({
-            "sym":sym,
-            "sector":sec,
-            "ltp":ltp,
-            "change":change,
-            "rsi":rsi(closes),
-            "adx":adx(closes),
-            "atr":atr(day_df.iloc[:4]),
-            "breakout":breakout,
-            "volume":volume_ok
+            "sym": sym,
+            "sector": sec,
+            "ltp": ltp,
+            "change": change,
+            "rsi": rsi(closes),
+            "adx": adx(closes),
+            "atr": atr(day_df.iloc[:4]),
+            "breakout": breakout,
+            "volume": volume_ok
         })
 
         sector_strength.setdefault(sec, []).append(change)
 
-    sector_strength = {k:sum(v)/len(v) for k,v in sector_strength.items() if v}
+    # ===== SECTOR STRENGTH =====
+    sector_strength = {
+        k: sum(v) / len(v)
+        for k, v in sector_strength.items() if v
+    }
 
-    signals=[]
+    # ===== SIGNAL FILTER =====
+    signals = []
 
     for s in pool:
 
-        sec_str=sector_strength.get(s["sector"],0)
-        direction="BUY" if s["change"]>0 else "SELL"
+        sec_str = sector_strength.get(s["sector"], 0)
+        direction = "BUY" if s["change"] > 0 else "SELL"
 
-        score=0
+        score = 0
 
-        if abs(sec_str)>0.7: score+=1
-        if abs(s["change"])>1: score+=1
-        if s["adx"]>20: score+=1
-        if s["breakout"]: score+=1
-        if s["volume"]: score+=1
+        if abs(sec_str) > 0.7: score += 1
+        if abs(s["change"]) > 1: score += 1
+        if s["adx"] > 20: score += 1
+        if s["breakout"]: score += 1
+        if s["volume"]: score += 1
 
-        if direction=="BUY" and s["rsi"]>55: score+=1
-        if direction=="SELL" and s["rsi"]<45: score+=1
+        if direction == "BUY" and s["rsi"] > 55: score += 1
+        if direction == "SELL" and s["rsi"] < 45: score += 1
 
-        if score>=4:
-            signals.append((s,direction))
+        if score >= 4:
+            signals.append((s, direction))
 
     if not signals:
         continue
 
-    # pick best
-    s,direction = sorted(signals, key=lambda x:abs(x[0]["change"]), reverse=True)[0]
+    # ===== PICK BEST STOCK =====
+    s, direction = sorted(
+        signals,
+        key=lambda x: abs(x[0]["change"]),
+        reverse=True
+    )[0]
 
     entry = s["ltp"]
     exit_price = day_df.iloc[-1]['close']
 
-    if direction=="BUY":
-        pnl = ((exit_price-entry)/entry)*100
+    if direction == "BUY":
+        pnl = ((exit_price - entry) / entry) * 100
     else:
-        pnl = ((entry-exit_price)/entry)*100
+        pnl = ((entry - exit_price) / entry) * 100
 
     results.append(pnl)
 
-# ===== RESULT =====
+
+# ===== FINAL RESULT =====
 total = len(results)
-wins = len([x for x in results if x>0])
-winrate = (wins/total)*100 if total else 0
+wins = len([x for x in results if x > 0])
+winrate = (wins / total) * 100 if total else 0
 
 print("\n📊 BACKTEST RESULT (3 Months)\n")
 print("Total Trades:", total)
-print("Win Rate:", round(winrate,2), "%")
-print("Avg Return:", round(np.mean(results),2), "%")
+print("Win Rate:", round(winrate, 2), "%")
+print("Avg Return:", round(np.mean(results), 2), "%")
