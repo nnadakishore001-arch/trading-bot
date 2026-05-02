@@ -1,8 +1,6 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from SmartApi import SmartConnect
-import pyotp
+import yfinance as yf
 import requests
 
 # ===== TELEGRAM =====
@@ -10,20 +8,13 @@ TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
 CHAT_ID = "890425913"
 
 def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except Exception as e:
+        print("Telegram Error:", e)
 
-# ===== LOGIN =====
-API_KEY = "VYFnGUA8"
-CLIENT_ID = "M373866"
-PASSWORD = "0917"
-TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
-
-obj = SmartConnect(api_key=API_KEY)
-totp = pyotp.TOTP(TOTP_SECRET).now()
-obj.generateSession(CLIENT_ID, PASSWORD, totp)
-
-send("🚀 FINAL BACKTEST STARTED (9:30 STRATEGY)")
+send("🚀 BACKTEST STARTED")
 
 # ===== SECTORS =====
 SECTORS = {
@@ -46,6 +37,7 @@ INDEX = {
 # ================= DATA =================
 def get_data(symbol):
     df = yf.download(symbol + ".NS", period="3mo", interval="5m", progress=False)
+
     if df.empty:
         return pd.DataFrame()
 
@@ -60,6 +52,7 @@ def get_data(symbol):
 
 def get_index(symbol):
     df = yf.download(symbol, period="3mo", interval="5m", progress=False)
+
     df = df.reset_index()
     df.rename(columns={"Datetime":"time","Open":"open","Close":"close"}, inplace=True)
     df['date'] = df['time'].dt.date
@@ -67,6 +60,7 @@ def get_index(symbol):
 
 # ================= LOAD =================
 market_data = {}
+
 for sec, stocks in SECTORS.items():
     for sym in stocks:
         df = get_data(sym)
@@ -93,16 +87,14 @@ for day in dates:
         n_df = nifty[nifty['date'] == day].iloc[:4]
         b_df = banknifty[banknifty['date'] == day].iloc[:4]
 
-        if len(n_df) < 4 or len(b_df) < 4:
+        if len(n_df) < 4:
             continue
 
         n_change = (n_df.iloc[3]['close'] - n_df.iloc[0]['open']) / n_df.iloc[0]['open'] * 100
-        b_change = (b_df.iloc[3]['close'] - b_df.iloc[0]['open']) / b_df.iloc[0]['open'] * 100
 
     except:
         continue
 
-    # Skip sideways market
     if abs(n_change) < 0.3:
         continue
 
@@ -126,12 +118,10 @@ for day in dates:
 
         change = ((ltp - open_p) / open_p) * 100
 
-        # ORB
         high_920 = first6.iloc[:3]['high'].max()
         low_920 = first6.iloc[:3]['low'].min()
         breakout = ltp > high_920 or ltp < low_920
 
-        # Volume
         vol_now = first6.iloc[3]['volume']
         avg_vol = first6.iloc[:5]['volume'].mean()
         volume_ok = vol_now > 1.5 * avg_vol if avg_vol != 0 else False
@@ -147,10 +137,10 @@ for day in dates:
             "ltp": ltp,
             "change": change,
             "breakout": breakout,
-            "volume": volume_ok
+            "volume": volume_ok,
+            "df": day_df   # ✅ FIX HERE
         })
 
-    # Sector strength
     sector_strength = {k: sum(v)/len(v) for k, v in sector_strength.items() if v}
 
     signals = []
@@ -178,21 +168,17 @@ for day in dates:
 
     signals.sort(key=lambda x: abs(x[0]["change"]), reverse=True)
 
-    top2 = signals[:2]
-    final = top2[0][0]
-    direction = top2[0][1]
-
-    entry = final["ltp"]
+    s, direction = signals[0]
+    entry = s["ltp"]
+    day_df = s["df"]   # ✅ CORRECT DATA USED
 
     sl = entry * 0.99 if direction == "BUY" else entry * 1.01
     tp = entry * 1.02 if direction == "BUY" else entry * 0.98
 
-    full_day = df[df['date'] == day]
-
     pnl = 0
     result = "NONE"
 
-    for _, row in full_day.iterrows():
+    for _, row in day_df.iterrows():
 
         if direction == "BUY":
             if row['high'] >= tp:
@@ -214,7 +200,7 @@ for day in dates:
                 break
 
     results.append(pnl)
-    logs.append(f"{day} | {direction} {final['sym']} | {result} | {pnl}%")
+    logs.append(f"{day} | {direction} {s['sym']} | {result} | {pnl}%")
 
 # ================= RESULT =================
 total = len(results)
@@ -223,7 +209,7 @@ winrate = (wins / total) * 100 if total else 0
 avg = np.mean(results) if results else 0
 
 summary = f"""
-📊 BACKTEST RESULT (3 Months)
+📊 BACKTEST RESULT
 
 Total Trades: {total}
 Win Rate: {round(winrate,2)}%
@@ -233,5 +219,4 @@ Avg Return: {round(avg,2)}%
 print(summary)
 send(summary)
 
-# Sample trades
-send("🔥 SAMPLE TRADES:\n" + "\n".join(logs[:15]))
+send("🔥 SAMPLE:\n" + "\n".join(logs[:15]))
