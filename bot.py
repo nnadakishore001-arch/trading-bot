@@ -62,9 +62,9 @@ SECTORS = {
 # ===== DATE RANGE =====
 end = datetime.now()
 start = end - timedelta(days=90)
+
 # ================= GET DATA =================
 def get_data(token):
-
     try:
         params = {
             "exchange": "NSE",
@@ -76,26 +76,20 @@ def get_data(token):
 
         res = obj.getCandleData(params)
 
-        # ===== HARD CHECK =====
         if not isinstance(res, dict):
             return pd.DataFrame()
 
-        if 'data' not in res or res['data'] is None:
-            return pd.DataFrame()
-
-        if len(res['data']) == 0:
+        if 'data' not in res or not res['data']:
             return pd.DataFrame()
 
         df = pd.DataFrame(res['data'])
 
-        # Handle variable column count
         if df.shape[1] < 6:
             return pd.DataFrame()
 
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
 
-        # ===== SAFE TYPE CONVERSION =====
         df['time'] = pd.to_datetime(df['time'], errors='coerce')
 
         for col in ["open","high","low","close","volume"]:
@@ -123,7 +117,7 @@ for sec, stocks in SECTORS.items():
 
         df = get_data(token)
 
-        if df is None or df.empty:
+        if df.empty:
             print(f"⚠️ No data for {sym}")
             continue
 
@@ -196,7 +190,7 @@ for day in dates:
 
         day_df = df[df['date'] == day]
 
-        if day_df is None or day_df.empty:
+        if day_df.empty:
             continue
 
         day_df = day_df.sort_values(by="time")
@@ -216,22 +210,17 @@ for day in dates:
             continue
 
         change = ((ltp - open_p) / open_p) * 100
-
         closes = first4['close'].astype(float).values
 
-        # ===== ORB =====
+        # ORB
         high_920 = float(first4.iloc[:2]['high'].max())
         low_920 = float(first4.iloc[:2]['low'].min())
         breakout = (ltp > high_920) or (ltp < low_920)
 
-        # ===== VOLUME =====
+        # Volume
         vol_now = float(first4.iloc[3]['volume'])
         avg_vol = float(first4.iloc[:3]['volume'].mean())
-
-        if avg_vol == 0:
-            volume_ok = False
-        else:
-            volume_ok = vol_now > 1.5 * avg_vol
+        volume_ok = vol_now > 1.5 * avg_vol if avg_vol != 0 else False
 
         pool.append({
             "sym": sym,
@@ -279,26 +268,20 @@ for day in dates:
     if not signals:
         continue
 
-    best = sorted(signals, key=lambda x: abs(x[0]["change"]), reverse=True)[0]
-
-    s, direction = best
+    s, direction = sorted(
+        signals,
+        key=lambda x: abs(x[0]["change"]),
+        reverse=True
+    )[0]
 
     entry = s["ltp"]
 
-    full_day = df[df['date'] == day]
+    full_day = df[df['date'] == day].sort_values(by="time")
 
-    if full_day is None or full_day.empty:
+    if full_day.empty:
         continue
 
-    full_day = full_day.sort_values(by="time")
-
-    try:
-        exit_price = float(full_day.iloc[-1]['close'])
-    except:
-        continue
-
-    if entry == 0:
-        continue
+    exit_price = float(full_day.iloc[-1]['close'])
 
     if direction == "BUY":
         pnl = ((exit_price - entry) / entry) * 100
