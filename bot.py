@@ -1,8 +1,16 @@
+import pandas as pd
 import requests
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 import pyotp
+
+# ===== TELEGRAM =====
+TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
+CHAT_ID = "554695395"
+
+def send(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
 # ===== LOGIN =====
 API_KEY = "VYFnGUA8"
@@ -11,137 +19,163 @@ PASSWORD = "0917"
 TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
 totp = pyotp.TOTP(TOTP_SECRET).now()
-
 obj = SmartConnect(api_key=API_KEY)
 obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-print("Login Success")
-
-# ===== TELEGRAM =====
-TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
-CHAT_ID = "890425913"
-
-def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"  # ✅ FIXED HERE
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-
-# ===== LOGIN =====
-def login():
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    obj = SmartConnect(api_key=API_KEY)
-    obj.generateSession(CLIENT_ID, PASSWORD, totp)
-    return obj
+send("🚀 Starting 5-Month Backtest...")
 
 # ===== F&O STOCKS =====
 SECTORS = {
-    "BANK": {
-        "HDFCBANK": "1333",
-        "ICICIBANK": "4963",
-        "SBIN": "3045",
-        "AXISBANK": "5900",
-        "KOTAKBANK": "1922"
-    },
-    "IT": {
-        "TCS": "11536",
-        "INFY": "1594",
-        "HCLTECH": "7229",
-        "WIPRO": "3787",
-        "TECHM": "13538"
-    },
-    "AUTO": {
-        "TATAMOTORS": "3456",
-        "MARUTI": "10999",
-        "M&M": "2031",
-        "BAJAJ-AUTO": "16669"
-    },
-    "FMCG": {
-        "ITC": "1660",
-        "HINDUNILVR": "1394",
-        "NESTLEIND": "17963"
-    },
-    "ENERGY": {
-        "RELIANCE": "2885",
-        "ONGC": "2475"
-    }
+    "BANK": {"HDFCBANK": "1333", "ICICIBANK": "4963", "SBIN": "3045"},
+    "IT": {"TCS": "11536", "INFY": "1594", "HCLTECH": "7229"},
+    "AUTO": {"TATAMOTORS": "3456", "MARUTI": "10999"},
 }
 
-# ===== GET PRICE CHANGE =====
-def get_change(obj, symbol, token):
-    data = obj.ltpData("NSE", symbol, token)['data']
-    ltp = data['ltp']
-    open_price = data['open']
-    change = ((ltp - open_price) / open_price) * 100
-    return ltp, change
+# ===== DATE RANGE =====
+end_date = datetime.now()
+start_date = end_date - timedelta(days=150)
 
-# ===== HEATMAP =====
-def format_heatmap(sector_data):
-    sorted_sec = sorted(sector_data.items(), key=lambda x: x[1], reverse=True)
+def get_data(token):
+    params = {
+        "exchange": "NSE",
+        "symboltoken": token,
+        "interval": "FIVE_MINUTE",
+        "fromdate": start_date.strftime("%Y-%m-%d 09:15"),
+        "todate": end_date.strftime("%Y-%m-%d 15:30")
+    }
 
-    msg = "📊 Sector Heatmap\n\n"
+    data = obj.getCandleData(params)
 
-    for sec, pct in sorted_sec:
-        bars = int(abs(pct) * 3)
+    if not data['data']:
+        return pd.DataFrame()
 
-        if pct > 0:
-            bar = "🟢" * bars
-        else:
-            bar = "🔴" * bars
+    df = pd.DataFrame(data['data'], columns=["time","open","high","low","close","volume"])
+    df['time'] = pd.to_datetime(df['time'])
+    df['date'] = df['time'].dt.date
+    return df
 
-        msg += f"{sec:<8} {pct:+.2f}%  {bar}\n"
+# ===== LOAD DATA =====
+market_data = {}
 
-    return msg
+for sector, stocks in SECTORS.items():
+    for sym, token in stocks.items():
+        try:
+            df = get_data(token)
+            if not df.empty:
+                market_data[sym] = {"sector": sector, "df": df}
+        except:
+            pass
 
-# ===== MAIN LOGIC =====
-def run_screener():
-    send("🚀 Running F&O Sector Screener...")
+# ===== BACKTEST =====
+results = []
+daily_picks = {}
 
-    obj = login()
+all_dates = sorted(set(
+    d for v in market_data.values()
+    for d in v["df"]["date"]
+))
+
+for day in all_dates:
 
     sector_strength = {}
-    stock_data = []
+    stock_moves = []
 
-    for sector, stocks in SECTORS.items():
-        changes = []
+    for sym, data in market_data.items():
 
-        for sym, tok in stocks.items():
-            try:
-                ltp, change = get_change(obj, sym, tok)
+        df = data["df"]
+        sector = data["sector"]
 
-                if abs(change) < 0.8:
-                    continue
+        day_df = df[df['date'] == day]
 
-                changes.append(change)
-                stock_data.append((sym, tok, change, ltp, sector))
+        if day_df.empty:
+            continue
 
-            except:
-                pass
+        open_915 = day_df[day_df['time'].dt.strftime("%H:%M") == "09:15"]
+        candle_930 = day_df[day_df['time'].dt.strftime("%H:%M") == "09:30"]
 
-        if changes:
-            sector_strength[sector] = sum(changes) / len(changes)
+        if open_915.empty or candle_930.empty:
+            continue
 
-    send(format_heatmap(sector_strength))
+        open_price = open_915.iloc[0]['open']
+        price_930 = candle_930.iloc[0]['close']
 
-    filtered = []
+        change = ((price_930 - open_price) / open_price) * 100
 
-    for sym, tok, change, ltp, sector in stock_data:
-        if sector_strength.get(sector, 0) > 0.5:
-            filtered.append((sym, tok, change, ltp, sector))
+        stock_moves.append((sym, sector, change, price_930))
+
+        if sector not in sector_strength:
+            sector_strength[sector] = []
+
+        sector_strength[sector].append(change)
+
+    sector_strength = {k: sum(v)/len(v) for k, v in sector_strength.items() if v}
+    strong_sectors = {k: v for k, v in sector_strength.items() if v > 0.5}
+
+    filtered = [
+        (sym, sec, chg, price)
+        for sym, sec, chg, price in stock_moves
+        if sec in strong_sectors and chg > 0.8
+    ]
+
+    if not filtered:
+        continue
 
     filtered.sort(key=lambda x: x[2], reverse=True)
     top_stocks = filtered[:2]
 
-    msg = "\n🔥 Top Picks (F&O)\n\n"
+    # ===== SAVE DAILY PICKS =====
+    daily_picks[day] = top_stocks
 
-    for sym, tok, change, ltp, sector in top_stocks:
-        direction = "BUY" if change > 0 else "SELL"
+    # ===== EXIT =====
+    for sym, sec, chg, entry in top_stocks:
 
-        msg += f"{direction} {sym}\n"
-        msg += f"Sector: {sector}\n"
-        msg += f"LTP: {ltp}\n"
-        msg += f"Move: {change:.2f}%\n\n"
+        df = market_data[sym]["df"]
+        day_df = df[df['date'] == day]
 
-    send(msg)
+        exit_candle = day_df[day_df['time'].dt.strftime("%H:%M") == "15:15"]
 
-# ===== RUN =====
-if __name__ == "__main__":
-    run_screener()
+        if exit_candle.empty:
+            continue
+
+        exit_price = exit_candle.iloc[0]['close']
+
+        pnl = ((exit_price - entry) / entry) * 100
+
+        results.append({
+            "date": day,
+            "stock": sym,
+            "sector": sec,
+            "pnl%": pnl
+        })
+
+df_results = pd.DataFrame(results)
+
+# ===== SEND SUMMARY =====
+summary = f"""
+📊 BACKTEST RESULT (5 Months)
+
+Total Trades: {len(df_results)}
+Win Rate: {round((df_results['pnl%'] > 0).mean()*100, 2)}%
+Avg Return: {round(df_results['pnl%'].mean(), 2)}%
+"""
+send(summary)
+
+# ===== SEND TOP TRADES =====
+top_trades = df_results.sort_values(by="pnl%", ascending=False).head(5)
+
+msg = "🔥 Top Trades\n\n"
+for _, row in top_trades.iterrows():
+    msg += f"{row['stock']} | {row['date']} | {round(row['pnl%'],2)}%\n"
+
+send(msg)
+
+# ===== SEND DAILY PICKS =====
+msg = "📅 DAILY PICKS (2 Stocks Each Day)\n\n"
+
+for day, picks in list(daily_picks.items())[:10]:  # limit to avoid spam
+    msg += f"{day}:\n"
+    for sym, sec, chg, price in picks:
+        msg += f"  {sym} ({sec}) +{round(chg,2)}%\n"
+    msg += "\n"
+
+send(msg)
