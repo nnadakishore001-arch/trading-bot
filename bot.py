@@ -17,10 +17,17 @@ def send(msg):
     except:
         pass
 
-# ===== LOGIN =====
-obj = SmartConnect(api_key="API_KEY")
-totp = pyotp.TOTP("TOTP").now()
-obj.generateSession("CLIENT", "PASS", totp)
+# ========= LOGIN =========
+API_KEY = "VYFnGUA8"
+CLIENT_ID = "M373866"
+PASSWORD = "0917"
+TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
+
+def login():
+    obj = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    obj.generateSession(CLIENT_ID, PASSWORD, totp)
+    return obj
 
 send("🚀 FINAL OPTIMIZED BACKTEST STARTED")
 
