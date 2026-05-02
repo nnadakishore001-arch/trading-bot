@@ -23,82 +23,57 @@ obj = SmartConnect(api_key=API_KEY)
 totp = pyotp.TOTP(TOTP_SECRET).now()
 obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-send("📊 BACKTEST (LIVE LOGIC) STARTED")
+send("🚀 FINAL BACKTEST STARTED (9:30 STRATEGY)")
 
-# ===== DATE RANGE =====
-end = datetime.now()
-start = end - timedelta(days=90)
-
-# ===== SAME SECTORS =====
+# ===== SECTORS =====
 SECTORS = {
-    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922","INDUSINDBK":"5258"},
-    "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787","LTIM":"17818"},
-    "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669","EICHERMOT":"910"},
-    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694","DRREDDY":"881","DIVISLAB":"10940"},
-    "FMCG": {"ITC":"1660","HINDUNILVR":"1394","NESTLEIND":"17963","BRITANNIA":"547"},
-    "METAL": {"TATASTEEL":"3499","JSWSTEEL":"11723","HINDALCO":"1363","VEDL":"3063"},
-    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630","POWERGRID":"14977"},
-    "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675","CHOLAFIN":"685"},
-    "INFRA": {"LT":"11483","ADANIPORTS":"15083","ADANIENT":"25"},
+    "BANK": {"HDFCBANK":"HDFCBANK","ICICIBANK":"ICICIBANK","SBIN":"SBIN","AXISBANK":"AXISBANK","KOTAKBANK":"KOTAKBANK","INDUSINDBK":"INDUSINDBK"},
+    "IT": {"TCS":"TCS","INFY":"INFY","HCLTECH":"HCLTECH","TECHM":"TECHM","WIPRO":"WIPRO","LTIM":"LTIM"},
+    "AUTO": {"TATAMOTORS":"TATAMOTORS","MARUTI":"MARUTI","M&M":"M&M","BAJAJ-AUTO":"BAJAJ-AUTO","EICHERMOT":"EICHERMOT"},
+    "PHARMA": {"SUNPHARMA":"SUNPHARMA","CIPLA":"CIPLA","DRREDDY":"DRREDDY","DIVISLAB":"DIVISLAB"},
+    "FMCG": {"ITC":"ITC","HINDUNILVR":"HINDUNILVR","NESTLEIND":"NESTLEIND","BRITANNIA":"BRITANNIA"},
+    "METAL": {"TATASTEEL":"TATASTEEL","JSWSTEEL":"JSWSTEEL","HINDALCO":"HINDALCO","VEDL":"VEDL"},
+    "ENERGY": {"RELIANCE":"RELIANCE","ONGC":"ONGC","NTPC":"NTPC","POWERGRID":"POWERGRID"},
+    "NBFC": {"BAJFINANCE":"BAJFINANCE","BAJAJFINSV":"BAJAJFINSV","CHOLAFIN":"CHOLAFIN"},
+    "INFRA": {"LT":"LT","ADANIPORTS":"ADANIPORTS","ADANIENT":"ADANIENT"},
 }
 
-def get_data(token):
+# ================= GET DATA =================
+def get_data(symbol):
+    try:
+        df = yf.download(symbol + ".NS", period="3mo", interval="5m", progress=False)
 
-    all_data = []
+        if df.empty:
+            return pd.DataFrame()
 
-    current_start = start
+        df = df.reset_index()
 
-    while current_start < end:
+        df.rename(columns={
+            "Datetime":"time",
+            "Open":"open",
+            "High":"high",
+            "Low":"low",
+            "Close":"close",
+            "Volume":"volume"
+        }, inplace=True)
 
-        current_end = current_start + timedelta(days=7)
+        df['date'] = df['time'].dt.date
 
-        if current_end > end:
-            current_end = end
+        return df
 
-        try:
-            params = {
-                "exchange": "NSE",
-                "symboltoken": token,
-                "interval": "FIVE_MINUTE",
-                "fromdate": current_start.strftime("%Y-%m-%d 09:15"),
-                "todate": current_end.strftime("%Y-%m-%d 15:30")
-            }
-
-            res = obj.getCandleData(params)
-
-            if res and 'data' in res and res['data']:
-                all_data.extend(res['data'])
-
-        except:
-            pass
-
-        current_start = current_end
-
-    if not all_data:
+    except:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_data)
-
-    df = df.iloc[:, :6]
-    df.columns = ["time","open","high","low","close","volume"]
-
-    df['time'] = pd.to_datetime(df['time'], errors='coerce')
-
-    for col in ["open","high","low","close","volume"]:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    df = df.dropna()
-    df['date'] = df['time'].dt.date
-
-    return df
-# ================= LOAD =================
+# ================= LOAD DATA =================
 market_data = {}
 
 for sec, stocks in SECTORS.items():
-    for sym, token in stocks.items():
-        df = get_data(token)
+    for sym in stocks.keys():
+
+        df = get_data(sym)
+
         if not df.empty and len(df) > 50:
-            market_data[sym] = {"sector":sec,"df":df}
+            market_data[sym] = {"sector": sec, "df": df}
 
 send(f"✅ Loaded {len(market_data)} stocks")
 
@@ -121,7 +96,7 @@ for day in dates:
         df = data["df"]
         sec = data["sector"]
 
-        day_df = df[df['date']==day].sort_values(by="time")
+        day_df = df[df['date'] == day].sort_values(by="time")
 
         if len(day_df) < 4:
             continue
@@ -132,7 +107,7 @@ for day in dates:
         open_p = first4.iloc[0]['open']
         ltp = first4.iloc[3]['close']
 
-        change = ((ltp - open_p)/open_p)*100
+        change = ((ltp - open_p) / open_p) * 100
 
         sector_strength.setdefault(sec, []).append(change)
 
@@ -146,16 +121,15 @@ for day in dates:
             "change": change
         })
 
-    # ===== SECTOR STRENGTH =====
     sector_strength = {
-        k: sum(v)/len(v)
-        for k,v in sector_strength.items() if v
+        k: sum(v) / len(v)
+        for k, v in sector_strength.items() if v
     }
 
     if not pool:
         continue
 
-    # ===== PICK TOP 2 =====
+    # ===== TOP 2 =====
     pool = sorted(pool, key=lambda x: abs(x['change']), reverse=True)
     top2 = pool[:2]
 
@@ -168,32 +142,28 @@ for day in dates:
     sl = entry * 0.99 if direction == "BUY" else entry * 1.01
     tp = entry * 1.02 if direction == "BUY" else entry * 0.98
 
-    full_day = df[df['date']==day]
+    full_day = df[df['date'] == day]
 
     pnl = 0
     result = "NONE"
 
     for _, row in full_day.iterrows():
 
-        high = row['high']
-        low = row['low']
-
         if direction == "BUY":
-            if high >= tp:
+            if row['high'] >= tp:
                 pnl = 2
                 result = "TP"
                 break
-            elif low <= sl:
+            elif row['low'] <= sl:
                 pnl = -1
                 result = "SL"
                 break
-
         else:
-            if low <= tp:
+            if row['low'] <= tp:
                 pnl = 2
                 result = "TP"
                 break
-            elif high >= sl:
+            elif row['high'] >= sl:
                 pnl = -1
                 result = "SL"
                 break
@@ -205,11 +175,11 @@ for day in dates:
 # ================= RESULT =================
 total = len(results)
 wins = len([x for x in results if x > 0])
-winrate = (wins / total)*100 if total else 0
+winrate = (wins / total) * 100 if total else 0
 avg = np.mean(results) if results else 0
 
 summary = f"""
-📊 BACKTEST RESULT (LIVE LOGIC)
+📊 FINAL BACKTEST (9:30 STRATEGY)
 
 Total Trades: {total}
 Win Rate: {round(winrate,2)}%
@@ -219,5 +189,4 @@ Avg Return: {round(avg,2)}%
 print(summary)
 send(summary)
 
-# ===== SAMPLE TRADES =====
 send("🔥 SAMPLE TRADES:\n" + "\n".join(logs[:15]))
