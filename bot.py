@@ -59,6 +59,10 @@ SECTORS = {
     "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
 }
+# ===== DATE RANGE =====
+end = datetime.now()
+start = end - timedelta(days=90)
+
 # ================= GET DATA =================
 def get_data(token):
 
