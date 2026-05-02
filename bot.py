@@ -1,228 +1,226 @@
-import requests
-import time
-import pyotp
+import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
+import pyotp
 
-# ================= TELEGRAM =================
+# ===== TELEGRAM =====
 TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
 CHAT_ID = "890425913"
 
 def send(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-    except Exception as e:
-        print("Telegram Error:", e)
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# ================= LOGIN =================
+# ===== LOGIN =====
 API_KEY = "VYFnGUA8"
 CLIENT_ID = "M373866"
 PASSWORD = "0917"
 TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
-def login():
-    obj = SmartConnect(api_key=API_KEY)
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    obj.generateSession(CLIENT_ID, PASSWORD, totp)
-    return obj
+obj = SmartConnect(api_key=API_KEY)
+totp = pyotp.TOTP(TOTP_SECRET).now()
+obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-# ================= SECTORS =================
+print("✅ Login Success")
+
+# ===== DATE RANGE =====
+end = datetime.now()
+start = end - timedelta(days=90)
+
+# ===== SECTORS =====
 SECTORS = {
-    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900"},
-    "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229"},
-    "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999"},
+    "BANK":   {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045",
+               "AXISBANK":"5900","KOTAKBANK":"1922","INDUSINDBK":"5258"},
+    "IT":     {"TCS":"11536","INFY":"1594","HCLTECH":"7229",
+               "TECHM":"13538","WIPRO":"3787","LTIM":"17818"},
+    "AUTO":   {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031",
+               "BAJAJ-AUTO":"16669","EICHERMOT":"910"},
+    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694","DRREDDY":"881","DIVISLAB":"10940"},
+    "FMCG":   {"ITC":"1660","HINDUNILVR":"1394","NESTLEIND":"17963","BRITANNIA":"547"},
+    "METAL":  {"TATASTEEL":"3499","JSWSTEEL":"11723","HINDALCO":"1363","VEDL":"3063"},
+    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630","POWERGRID":"14977"},
+    "NBFC":   {"BAJFINANCE":"317","BAJAJFINSV":"16675","CHOLAFIN":"685"},
+    "INFRA":  {"LT":"11483","ADANIPORTS":"15083","ADANIENT":"25"},
 }
 
-# ================= INDICATORS (SAME LOGIC) =================
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
-    deltas = np.diff(closes)
-    gain = np.where(deltas > 0, deltas, 0)
-    loss = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gain[:period])
-    avg_loss = np.mean(loss[:period])
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calc_atr(candles, period=14):
-    if len(candles) < 2:
-        return 0
-    tr = []
-    for i in range(1, len(candles)):
-        h,l,pc = candles[i][2], candles[i][3], candles[i-1][4]
-        tr.append(max(h-l, abs(h-pc), abs(l-pc)))
-    return np.mean(tr[-period:])
-
-def calc_vwap(candles):
-    pv = sum(((c[2]+c[3]+c[4])/3)*c[5] for c in candles)
-    vol = sum(c[5] for c in candles)
-    return pv/vol if vol else 0
-
-def calc_adx(candles):
-    return 25  # simplified to avoid complexity (keeps logic intact threshold)
-
-def check_ema_cross(closes):
-    if len(closes) < 21:
-        return {"bull_align": False, "bear_align": False}
-    ema9 = np.mean(closes[-9:])
-    ema21 = np.mean(closes[-21:])
-    return {
-        "bull_align": ema9 > ema21,
-        "bear_align": ema9 < ema21
-    }
-
-# ================= DATA =================
-def get_historical(client, token, date):
+# ================= GET DATA =================
+def get_data(token):
     try:
         params = {
-            "exchange": "NSE",
-            "symboltoken": token,
-            "interval": "FIVE_MINUTE",
-            "fromdate": f"{date} 09:15",
-            "todate": f"{date} 15:30"
+            "exchange":"NSE",
+            "symboltoken":token,
+            "interval":"FIVE_MINUTE",
+            "fromdate":start.strftime("%Y-%m-%d 09:15"),
+            "todate":end.strftime("%Y-%m-%d 15:30")
         }
-        data = client.getCandleData(params)
-        return data["data"] if data and data.get("data") else []
+
+        data = obj.getCandleData(params)
+
+        if not data or 'data' not in data or not data['data']:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data['data'])
+        df = df.iloc[:, :6]
+        df.columns = ["time","open","high","low","close","volume"]
+
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        df = df.dropna()
+        df['date'] = df['time'].dt.date
+
+        return df
+
     except:
-        return []
+        return pd.DataFrame()
+
+# ================= LOAD DATA =================
+market_data = {}
+
+for sec, stocks in SECTORS.items():
+    for sym, token in stocks.items():
+        df = get_data(token)
+        if not df.empty and len(df) > 50:
+            market_data[sym] = {"sector":sec,"df":df}
+
+print(f"✅ Loaded {len(market_data)} stocks")
+
+# ================= INDICATORS =================
+def rsi(close):
+    diff = np.diff(close)
+    gain = np.mean([x for x in diff if x > 0] or [0])
+    loss = np.mean([-x for x in diff if x < 0] or [1])
+    rs = gain/loss if loss else 1
+    return 100 - (100/(1+rs))
+
+def adx(candles):
+    closes = [x[4] for x in candles]
+    return min(np.std(closes)*10, 50)
+
+def atr(df):
+    tr=[]
+    for i in range(1,len(df)):
+        tr.append(max(df.iloc[i]['high']-df.iloc[i]['low'],
+                      abs(df.iloc[i]['high']-df.iloc[i-1]['close'])))
+    return np.mean(tr) if tr else 0
+
+def vwap(df):
+    pv = ((df['high']+df['low']+df['close'])/3 * df['volume']).sum()
+    vol = df['volume'].sum()
+    return pv/vol if vol>0 else 0
 
 # ================= BACKTEST =================
-def backtest():
-    client = login()
+results = []
 
-    start = datetime.now() - timedelta(days=90)
-    end   = datetime.now()
+dates = sorted(set(
+    d for v in market_data.values()
+    for d in v["df"]["date"]
+))
 
-    total_trades = win = loss = no_trade = 0
+for day in dates:
 
-    while start <= end:
+    sector_strength={}
+    pool=[]
 
-        if start.weekday() >= 5:
-            start += timedelta(days=1)
+    for sym,data in market_data.items():
+
+        df=data["df"]
+        sec=data["sector"]
+
+        day_df=df[df['date']==day].sort_values(by="time")
+
+        if len(day_df)<6:
             continue
 
-        pool = []
-        sector_strength = {}
+        first6 = day_df.iloc[:6]
 
-        for sec, stocks in SECTORS.items():
-            changes = []
+        open_p = first6.iloc[0]['open']
+        ltp = first6.iloc[3]['close']
 
-            for sym, tok in stocks.items():
-                candles = get_historical(client, tok, start.strftime("%Y-%m-%d"))
-                if len(candles) < 10:
-                    continue
+        change=((ltp-open_p)/open_p)*100
 
-                closes = [c[4] for c in candles]
-                volumes = [c[5] for c in candles]
+        closes = first6['close'].values
 
-                open_p = candles[0][1]
-                ltp = candles[3][4]
+        # ORB
+        high_920 = first6.iloc[:3]['high'].max()
+        low_920 = first6.iloc[:3]['low'].min()
+        breakout = ltp > high_920 or ltp < low_920
 
-                change = (ltp - open_p) / open_p * 100
-                changes.append(change)
+        # Volume
+        vol_now = first6.iloc[3]['volume']
+        avg_vol = first6.iloc[:5]['volume'].mean()
+        volume_ok = vol_now > 1.5 * avg_vol if avg_vol!=0 else False
 
-                pool.append({
-                    "sym": sym,
-                    "sector": sec,
-                    "token": tok,
-                    "ltp": ltp,
-                    "change": change,
-                    "rsi": calc_rsi(closes[:5]),
-                    "adx": calc_adx(candles[:5]),
-                    "atr": calc_atr(candles[:5]),
-                    "vwap": calc_vwap(candles[:5]),
-                    "ema": check_ema_cross(closes[:5]),
-                    "candles": candles
-                })
+        pool.append({
+            "sym":sym,
+            "sector":sec,
+            "ltp":ltp,
+            "change":change,
+            "rsi":rsi(closes),
+            "adx":adx(first6.values.tolist()),
+            "vwap":vwap(first6),
+            "breakout":breakout,
+            "volume":volume_ok
+        })
 
-            if changes:
-                sector_strength[sec] = np.mean(changes)
+        sector_strength.setdefault(sec, []).append(change)
 
-        signals = []
+    sector_strength = {k:sum(v)/len(v) for k,v in sector_strength.items() if v}
 
-        for s in pool:
-            sec_str = sector_strength.get(s["sector"], 0)
-            direction = "BUY" if s["change"] > 0 else "SELL"
+    signals=[]
 
-            score = 0
-            if abs(sec_str) > 0.7: score += 1
-            if abs(s["change"]) > 1: score += 1
-            if s["adx"] > 20: score += 1
+    for s in pool:
 
-            if direction == "BUY" and s["ema"]["bull_align"]: score += 1
-            if direction == "SELL" and s["ema"]["bear_align"]: score += 1
+        sec_str = sector_strength.get(s["sector"],0)
+        direction = "BUY" if s["change"]>0 else "SELL"
 
-            if score >= 3:
-                signals.append(s)
+        score=0
 
-        if not signals:
-            no_trade += 1
-            start += timedelta(days=1)
-            continue
+        if abs(sec_str)>0.7: score+=1
+        if abs(s["change"])>1: score+=1
+        if s["breakout"]: score+=1
+        if s["volume"]: score+=1
 
-        signals = signals[:2]
+        if direction=="BUY" and s["ltp"]>s["vwap"]: score+=1
+        if direction=="SELL" and s["ltp"]<s["vwap"]: score+=1
 
-        for s in signals:
-            total_trades += 1
+        if direction=="BUY" and s["rsi"]>55 and s["adx"]>20: score+=1
+        if direction=="SELL" and s["rsi"]<45 and s["adx"]>20: score+=1
 
-            entry = s["ltp"]
-            atr = s["atr"]
-            risk = atr * 1.5
+        # Simulated index bias (simple)
+        if direction=="BUY" and sec_str>0: score+=1
+        if direction=="SELL" and sec_str<0: score+=1
 
-            candles = s["candles"][4:]
+        if score>=4:
+            signals.append((s,direction))
 
-            if s["change"] > 0:
-                sl = entry - risk
-                tp = entry + risk * 1.5
-            else:
-                sl = entry + risk
-                tp = entry - risk * 1.5
+    if not signals:
+        continue
 
-            result = "LOSS"
+    s,direction = sorted(signals, key=lambda x:abs(x[0]["change"]), reverse=True)[0]
 
-            for c in candles:
-                if s["change"] > 0:
-                    if c[3] <= sl:
-                        result = "LOSS"
-                        break
-                    if c[2] >= tp:
-                        result = "WIN"
-                        break
-                else:
-                    if c[2] >= sl:
-                        result = "LOSS"
-                        break
-                    if c[3] <= tp:
-                        result = "WIN"
-                        break
+    entry = s["ltp"]
 
-            if result == "WIN":
-                win += 1
-            else:
-                loss += 1
+    full_day = df[df['date']==day]
 
-        start += timedelta(days=1)
+    if full_day.empty:
+        continue
 
-    win_rate = round((win / total_trades) * 100, 2) if total_trades else 0
+    exit_price = full_day.iloc[-1]['close']
 
-    msg = f"""
-📊 BACKTEST RESULT (3 Months)
+    pnl = ((exit_price-entry)/entry)*100 if direction=="BUY" else ((entry-exit_price)/entry)*100
 
-Total Trades: {total_trades}
-Win Trades : {win}
-Loss Trades : {loss}
-No Trades : {no_trade}
-Win Rate: {win_rate}%
-"""
+    results.append(pnl)
 
-    print(msg)
-    send(msg)
+# ================= RESULT =================
+total = len(results)
+wins = len([x for x in results if x>0])
+winrate = (wins/total)*100 if total else 0
 
-# ================= RUN =================
-if __name__ == "__main__":
-    backtest()
+print("\n📊 PRO BACKTEST RESULT (3 Months)\n")
+print("Total Trades:", total)
+print("Win Rate:", round(winrate,2), "%")
+print("Avg Return:", round(np.mean(results),2), "%")
