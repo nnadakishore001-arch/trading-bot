@@ -85,52 +85,46 @@ INDICES = {
 
 # ========= DATA FETCH =========
 def get_data(token):
-    global obj, session_time
+    global obj
 
-    all_data = []
-    current = start
+    try:
+        res = obj.getCandleData({
+            "exchange": "NSE",
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": start.strftime("%Y-%m-%d 09:15"),
+            "todate": end.strftime("%Y-%m-%d 15:30")
+        })
 
-    while current < end:
-        nxt = current + timedelta(days=1)
-
-        # refresh session every 5 mins
-        if session_time and (datetime.now() - session_time).seconds > 300:
+        # Handle token expiry ONCE only
+        if res and res.get("errorCode") == "AG8001":
+            print("Token expired → relogin once")
+            time.sleep(5)
             obj = login()
-            if obj is None:
-                return pd.DataFrame()
 
-        try:
             res = obj.getCandleData({
                 "exchange": "NSE",
                 "symboltoken": token,
                 "interval": "FIVE_MINUTE",
-                "fromdate": current.strftime("%Y-%m-%d 09:15"),
-                "todate": nxt.strftime("%Y-%m-%d 15:30")
+                "fromdate": start.strftime("%Y-%m-%d 09:15"),
+                "todate": end.strftime("%Y-%m-%d 15:30")
             })
 
-            if res and res.get("errorCode") == "AG8001":
-                print("Token issue → relogin")
-                time.sleep(6)
-                obj = login()
-                continue
+        if not res or not res.get("data"):
+            print(f"❌ No data for token {token}")
+            return pd.DataFrame()
 
-            if res and res.get("data"):
-                all_data.extend(res["data"])
+        df = pd.DataFrame(res["data"], columns=["time","open","high","low","close","volume"])
+        df['time'] = pd.to_datetime(df['time'])
+        df['date'] = df['time'].dt.date
 
-        except Exception as e:
-            print("API error:", e)
+        time.sleep(1.5)  # 🔥 Important (rate control)
 
-        current = nxt
-        time.sleep(2.2)
+        return df
 
-    if not all_data:
+    except Exception as e:
+        print("API failed:", e)
         return pd.DataFrame()
-
-    df = pd.DataFrame(all_data, columns=["time","open","high","low","close","volume"])
-    df['time'] = pd.to_datetime(df['time'])
-    df['date'] = df['time'].dt.date
-    return df
-
 # ========= LOAD =========
 market = {}
 total_stocks = sum(len(v) for v in SECTORS.values())
