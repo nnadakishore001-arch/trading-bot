@@ -1,164 +1,257 @@
 import pandas as pd
 import numpy as np
-import requests
-import pyotp
-import time
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
+import pyotp
+import requests
+import time
 
-# ==============================================================================
-# CONFIG
-# ==============================================================================
-TOKEN_TG    = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
-CHAT_ID     = "890425913"
-API_KEY     = "VYFnGUA8"
-CLIENT_ID   = "M373866"
-PASSWORD    = "0917"
-TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
+# ========= TELEGRAM =========
+TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
+CHAT_ID = "890425913"
 
-BT_DAYS  = 45
-BT_END   = datetime.now()
-BT_START = BT_END - timedelta(days=BT_DAYS)
-
-# ==============================================================================
-# TELEGRAM
-# ==============================================================================
 def send(msg):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN_TG}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg},
-            timeout=10
-        )
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except:
         pass
 
-# ==============================================================================
-# SESSION MANAGEMENT (FIXED)
-# ==============================================================================
-_obj = None
-LAST_LOGIN = 0
+# ========= LOGIN =========
+API_KEY = "VYFnGUA8"
+CLIENT_ID = "M373866"
+PASSWORD = "0917"
+TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
+
+session_time = None
 
 def login():
-    global _obj, LAST_LOGIN
-
-    obj = SmartConnect(api_key=API_KEY)
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-
-    data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-
-    if not data.get("status"):
-        raise Exception(f"Login failed: {data}")
-
-    jwt_token     = data["data"]["jwtToken"]
-    refresh_token = data["data"]["refreshToken"]
-
-    obj.setAccessToken(jwt_token)
-    obj.setRefreshToken(refresh_token)
-
-    # VERY IMPORTANT
-    obj.generateToken(refresh_token)
-
-    time.sleep(1)  # stabilize session
-
-    _obj = obj
-    LAST_LOGIN = time.time()
-
-    print("✅ LOGIN SUCCESS")
-    return obj
-
-
-def ensure_session():
-    global LAST_LOGIN, _obj
-    if time.time() - LAST_LOGIN > 600:  # 10 min refresh
-        print("🔄 Refreshing session...")
-        _obj = login()
-
-
-def safe_call(api_func, *args, **kwargs):
-    global _obj
-
-    for i in range(3):
+    global session_time
+    for _ in range(3):
         try:
-            ensure_session()
-            res = api_func(*args, **kwargs)
+            obj = SmartConnect(api_key=API_KEY)
+            totp = pyotp.TOTP(TOTP_SECRET).now()
+            data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-            if isinstance(res, dict) and res.get("errorCode") == "AG8001":
-                print("⚠️ Token expired → Re-login")
-                _obj = login()
-                continue
+            if data.get("status"):
+                obj.setAccessToken(data['data']['jwtToken'])
+                session_time = datetime.now()
+                print("✅ Login Success")
+                return obj
+        except:
+            time.sleep(3)
 
-            return res
+    raise Exception("Login Failed")
 
-        except Exception as e:
-            print(f"Retry {i+1}: {e}")
-            time.sleep(2)
+obj = login()
+send("🚀 BACKTEST STARTED")
 
-    return None
+# ========= DATE (SAFE LAST 3 MONTHS) =========
+today = datetime.now()
 
+# Fix wrong system clock (if server shows future year)
+if today.year > 2025:
+    today = datetime(2025, 4, 30)
 
-# ==============================================================================
-# DATA FETCH (FIXED)
-# ==============================================================================
-def fetch_history(token, start, end):
-    all_rows = []
-    current  = start
+end = today
+start = end - timedelta(days=90)
+
+# ========= YOUR CONFIG =========
+SECTORS = {
+    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
+    "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
+    "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669"},
+    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694","DRREDDY":"881","DIVISLAB":"10940"},
+    "FMCG": {"ITC":"1660","HINDUNILVR":"1394","NESTLEIND":"17963"},
+    "METAL": {"TATASTEEL":"3499","JSWSTEEL":"11723","HINDALCO":"1363"},
+    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630","POWERGRID":"14977"},
+    "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
+    "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
+}
+
+INDICES = {
+    "NIFTY": "99926000",
+    "BANKNIFTY": "99926009"
+}
+
+# ========= DATA FETCH =========
+def get_data(token):
+    global obj, session_time
+
+    all_data = []
+    current = start
 
     while current < end:
-        ensure_session()
+        nxt = current + timedelta(days=1)   # ✅ smaller chunk
 
-        chunk_end = min(current + timedelta(days=5), end)
+        # refresh session every 5 mins
+        if session_time and (datetime.now() - session_time).seconds > 300:
+            print("♻️ Refreshing session")
+            obj = login()
 
-        params = {
-            "exchange": "NSE",
-            "symboltoken": token,
-            "interval": "FIVE_MINUTE",
-            "fromdate": current.strftime("%Y-%m-%d 09:15"),
-            "todate": chunk_end.strftime("%Y-%m-%d 15:30"),
-        }
+        try:
+            res = obj.getCandleData({
+                "exchange": "NSE",
+                "symboltoken": token,
+                "interval": "FIVE_MINUTE",
+                "fromdate": current.strftime("%Y-%m-%d 09:15"),
+                "todate": nxt.strftime("%Y-%m-%d 15:30")
+            })
 
-        res = safe_call(lambda: _obj.getCandleData(params))
+            # handle invalid token properly
+            if res and res.get("errorCode") == "AG8001":
+                print("🔁 Token expired → waiting before relogin")
+                time.sleep(5)
+                obj = login()
+                continue
 
-        if res and res.get("data"):
-            all_rows.extend(res["data"])
+            if res and res.get("data"):
+                all_data.extend(res["data"])
 
-        current = chunk_end + timedelta(days=1)
-        time.sleep(0.3)
+        except Exception as e:
+            print("API error:", e)
 
-    if not all_rows:
+        current = nxt
+
+        time.sleep(2.0)   # ✅ CRITICAL FIX (rate limit)
+
+    if not all_data:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_rows,
-        columns=["time","open","high","low","close","volume"])
-
-    df["time"] = pd.to_datetime(df["time"])
-    df["date"] = df["time"].dt.date
-
-    for col in ["open","high","low","close","volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna().sort_values("time").reset_index(drop=True)
-
+    df = pd.DataFrame(all_data, columns=["time","open","high","low","close","volume"])
+    df['time'] = pd.to_datetime(df['time'])
+    df['date'] = df['time'].dt.date
     return df
 
+# ========= LOAD =========
+market = {}
+for sec, stocks in SECTORS.items():
+    for sym, tok in stocks.items():
+        print(f"Fetching {sym}")
+        df = get_data(tok)
+        if not df.empty:
+            market[sym] = {"df": df, "sector": sec}
 
-# ==============================================================================
-# TEST RUN
-# ==============================================================================
-if __name__ == "__main__":
+index_data = {}
+for name, tok in INDICES.items():
+    df = get_data(tok)
+    if not df.empty:
+        index_data[name] = df
 
-    login()
+send(f"✅ Loaded {len(market)} stocks")
 
-    send("🚀 Backtest started...")
+# ========= BACKTEST =========
+results = []
+logs = []
 
-    print("Fetching sample stock (HCLTECH)...")
+dates = sorted(set(d for v in market.values() for d in v["df"]["date"]))
 
-    df = fetch_history("7229", BT_START, BT_END)
+for day in dates:
 
-    if df.empty:
-        print("❌ No data fetched")
-    else:
-        print("✅ Data fetched:", len(df), "rows")
-        print(df.head())
+    try:
+        n_df = index_data["NIFTY"]
+        n_day = n_df[n_df['date'] == day].sort_values("time")
 
-    send("✅ Data fetch completed")
+        if len(n_day) < 4:
+            continue
+
+        n_open = n_day.iloc[0]['open']
+        n_930  = n_day.iloc[3]['close']
+        index_dir = 1 if n_930 > n_open else -1
+
+    except:
+        continue
+
+    sector_strength = {}
+    pool = []
+
+    for sym, data in market.items():
+
+        df = data["df"]
+        sec = data["sector"]
+
+        day_df = df[df['date'] == day].sort_values("time")
+
+        if len(day_df) < 6:
+            continue
+
+        open_p = day_df.iloc[0]['open']
+        close_930 = day_df.iloc[3]['close']
+
+        change = ((close_930 - open_p) / open_p) * 100
+
+        sector_strength.setdefault(sec, []).append(change)
+
+        pool.append({
+            "sym": sym,
+            "sector": sec,
+            "change": change,
+            "ltp": close_930,
+            "df": day_df
+        })
+
+    if not pool:
+        continue
+
+    sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
+
+    signals = []
+    for s in pool:
+        sec_str = sector_strength.get(s["sector"], 0)
+
+        if abs(s["change"]) < 0.7:
+            continue
+
+        if (s["change"] > 0 and index_dir < 0) or (s["change"] < 0 and index_dir > 0):
+            continue
+
+        if abs(sec_str) < 0.3:
+            continue
+
+        signals.append(s)
+
+    if not signals:
+        continue
+
+    signals.sort(key=lambda x: abs(x["change"]), reverse=True)
+
+    final = signals[0]
+
+    direction = "BUY" if final["change"] > 0 else "SELL"
+    entry = final["ltp"]
+
+    sl = entry * 0.99 if direction == "BUY" else entry * 1.01
+    tp = entry * 1.02 if direction == "BUY" else entry * 0.98
+
+    pnl = 0
+
+    for _, row in final["df"].iterrows():
+        if direction == "BUY":
+            if row['high'] >= tp:
+                pnl = 2; break
+            elif row['low'] <= sl:
+                pnl = -1; break
+        else:
+            if row['low'] <= tp:
+                pnl = 2; break
+            elif row['high'] >= sl:
+                pnl = -1; break
+
+    results.append(pnl)
+    logs.append(f"{day} | {direction} {final['sym']} | {pnl}%")
+
+# ========= RESULT =========
+total = len(results)
+wins = len([x for x in results if x > 0])
+winrate = (wins / total) * 100 if total else 0
+
+msg = f"""
+📊 BACKTEST RESULT
+
+Trades: {total}
+Win Rate: {round(winrate,2)}%
+"""
+
+print(msg)
+send(msg)
+send("\n".join(logs[:10]))
