@@ -2,4 +2,9 @@ requests
 smartapi-python
 pyotp
 logzero
+pandas
+pandas-ta
+apscheduler
+pytz
+loguru
 websocket-client
