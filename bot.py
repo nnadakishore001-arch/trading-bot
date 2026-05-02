@@ -25,6 +25,7 @@ TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
 def login():
     obj = SmartConnect(api_key=API_KEY)
+
     totp = pyotp.TOTP(TOTP_SECRET).now()
     data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
@@ -32,14 +33,15 @@ def login():
         raise Exception("Login Failed")
 
     obj.setAccessToken(data['data']['jwtToken'])
+
     return obj
 
 obj = login()
 send("🚀 UPDATED BACKTEST STARTED")
 
 # ===== DATE RANGE =====
-start = datetime(2025, 2, 1)
-end = datetime(2025, 4, 30)
+start = datetime(2026, 2, 1)
+end = datetime(2026, 4, 30)
 
 # ===== YOUR SECTORS =====
 SECTORS = {
@@ -56,6 +58,9 @@ SECTORS = {
 
 # ================= DATA =================
 def get_data(token):
+
+    global obj
+
     all_data = []
     current = start
 
@@ -71,6 +76,14 @@ def get_data(token):
                 "todate": nxt.strftime("%Y-%m-%d 15:30")
             })
 
+            # 🔴 TOKEN EXPIRED → RELOGIN
+            if res and res.get("errorCode") == "AG8001":
+                print("🔁 Token expired → Re-login")
+
+                obj = login()
+
+                continue  # retry same chunk
+
             if res and 'data' in res and res['data']:
                 all_data.extend(res['data'])
 
@@ -78,7 +91,7 @@ def get_data(token):
             print("API Error:", e)
 
         current = nxt
-        time.sleep(0.15)   # faster but safe
+        time.sleep(0.2)
 
     if not all_data:
         return pd.DataFrame()
