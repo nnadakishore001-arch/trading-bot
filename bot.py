@@ -59,8 +59,9 @@ SECTORS = {
     "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
 }
-# ===== GET DATA =====
+# ================= GET DATA =================
 def get_data(token):
+
     try:
         params = {
             "exchange": "NSE",
@@ -70,31 +71,39 @@ def get_data(token):
             "todate": end.strftime("%Y-%m-%d 15:30")
         }
 
-        data = obj.getCandleData(params)
+        res = obj.getCandleData(params)
 
-        if not data or 'data' not in data or data['data'] is None:
+        # ===== SAFETY =====
+        if not res or 'data' not in res or not res['data']:
             return pd.DataFrame()
 
-        if len(data['data']) == 0:
-            return pd.DataFrame()
+        df = pd.DataFrame(res['data'])
 
-        df = pd.DataFrame(
-            data['data'],
-            columns=["time", "open", "high", "low", "close", "volume"]
-        )
+        # Fix columns dynamically
+        df = df.iloc[:, :6]
+        df.columns = ["time","open","high","low","close","volume"]
 
+        # ===== TYPE FIX =====
         df['time'] = pd.to_datetime(df['time'], errors='coerce')
+
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
         df = df.dropna()
+
+        if df.empty:
+            return pd.DataFrame()
+
         df['date'] = df['time'].dt.date
 
         return df
 
     except Exception as e:
-        print(f"❌ Error fetching token {token}: {e}")
+        print(f"❌ Error in token {token}: {e}")
         return pd.DataFrame()
 
 
-# ===== LOAD DATA =====
+# ================= LOAD DATA =================
 market_data = {}
 
 for sec, stocks in SECTORS.items():
@@ -118,8 +127,10 @@ for sec, stocks in SECTORS.items():
 print(f"✅ Loaded {len(market_data)} stocks successfully")
 
 
-# ===== INDICATORS =====
+# ================= INDICATORS =================
 def rsi(close):
+    if len(close) < 2:
+        return 50
     diff = np.diff(close)
     gain = np.mean([x for x in diff if x > 0] or [0])
     loss = np.mean([-x for x in diff if x < 0] or [1])
@@ -128,20 +139,27 @@ def rsi(close):
 
 
 def adx(close):
+    if len(close) < 2:
+        return 0
     return min(np.std(close) * 10, 50)
 
 
 def atr(df):
+    if len(df) < 2:
+        return 0
+
     tr = []
     for i in range(1, len(df)):
-        tr.append(max(
-            df.iloc[i]['high'] - df.iloc[i]['low'],
-            abs(df.iloc[i]['high'] - df.iloc[i-1]['close'])
-        ))
+        high = df.iloc[i]['high']
+        low = df.iloc[i]['low']
+        prev_close = df.iloc[i-1]['close']
+
+        tr.append(max(high - low, abs(high - prev_close)))
+
     return np.mean(tr) if tr else 0
 
 
-# ===== BACKTEST =====
+# ================= BACKTEST =================
 results = []
 
 dates = sorted(set(
@@ -159,26 +177,35 @@ for day in dates:
         df = data["df"]
         sec = data["sector"]
 
+        # ===== DAY DATA =====
         day_df = df[df['date'] == day].copy()
 
-        if day_df.empty or len(day_df) < 4:
+        if day_df.empty:
             continue
 
-        open_p = day_df.iloc[0]['open']
-        ltp = day_df.iloc[3]['close']
+        day_df = day_df.sort_values(by="time")
+
+        if len(day_df) < 4:
+            continue
+
+        # Take first 4 candles safely
+        first4 = day_df.head(4)
+
+        open_p = first4.iloc[0]['open']
+        ltp = first4.iloc[-1]['close']
 
         change = ((ltp - open_p) / open_p) * 100
 
-        closes = day_df['close'].values[:4]
+        closes = first4['close'].values
 
         # ===== ORB =====
-        high_920 = day_df.iloc[:2]['high'].max()
-        low_920 = day_df.iloc[:2]['low'].min()
+        high_920 = first4.iloc[:2]['high'].max()
+        low_920 = first4.iloc[:2]['low'].min()
         breakout = ltp > high_920 or ltp < low_920
 
         # ===== VOLUME =====
-        vol_now = day_df.iloc[3]['volume']
-        avg_vol = day_df.iloc[:3]['volume'].mean()
+        vol_now = first4.iloc[-1]['volume']
+        avg_vol = first4.iloc[:3]['volume'].mean()
         volume_ok = vol_now > 1.5 * avg_vol
 
         pool.append({
@@ -188,7 +215,7 @@ for day in dates:
             "change": change,
             "rsi": rsi(closes),
             "adx": adx(closes),
-            "atr": atr(day_df.iloc[:4]),
+            "atr": atr(first4),
             "breakout": breakout,
             "volume": volume_ok
         })
@@ -197,7 +224,7 @@ for day in dates:
 
     # ===== SECTOR STRENGTH =====
     sector_strength = {
-        k: sum(v) / len(v)
+        k: sum(v)/len(v)
         for k, v in sector_strength.items() if v
     }
 
@@ -226,7 +253,7 @@ for day in dates:
     if not signals:
         continue
 
-    # ===== PICK BEST STOCK =====
+    # ===== PICK BEST =====
     s, direction = sorted(
         signals,
         key=lambda x: abs(x[0]["change"]),
@@ -234,7 +261,14 @@ for day in dates:
     )[0]
 
     entry = s["ltp"]
-    exit_price = day_df.iloc[-1]['close']
+
+    # ===== EXIT PRICE (FULL DAY FIX) =====
+    full_day = df[df['date'] == day].sort_values(by="time")
+
+    if full_day.empty:
+        continue
+
+    exit_price = full_day.iloc[-1]['close']
 
     if direction == "BUY":
         pnl = ((exit_price - entry) / entry) * 100
@@ -244,7 +278,7 @@ for day in dates:
     results.append(pnl)
 
 
-# ===== FINAL RESULT =====
+# ================= FINAL RESULT =================
 total = len(results)
 wins = len([x for x in results if x > 0])
 winrate = (wins / total) * 100 if total else 0
