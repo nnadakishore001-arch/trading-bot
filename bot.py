@@ -66,6 +66,7 @@ start = end - timedelta(days=90)
 # ================= GET DATA =================
 def get_data(token):
     try:
+        # Fixed: Ensure 'start' and 'end' are defined globally or passed in
         params = {
             "exchange": "NSE",
             "symboltoken": token,
@@ -76,10 +77,7 @@ def get_data(token):
 
         res = obj.getCandleData(params)
 
-        if not isinstance(res, dict):
-            return pd.DataFrame()
-
-        if 'data' not in res or not res['data']:
+        if not isinstance(res, dict) or 'data' not in res or not res['data']:
             return pd.DataFrame()
 
         df = pd.DataFrame(res['data'])
@@ -89,214 +87,109 @@ def get_data(token):
 
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
-
+        
+        # Ensure numeric types for calculations
         df['time'] = pd.to_datetime(df['time'], errors='coerce')
-
         for col in ["open","high","low","close","volume"]:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df = df.dropna()
-
-        if df.empty:
-            return pd.DataFrame()
-
+        if df.empty: return pd.DataFrame()
+        
         df['date'] = df['time'].dt.date
-
         return df
 
     except Exception as e:
         print(f"❌ Error fetching {token}: {e}")
         return pd.DataFrame()
 
-
-# ================= LOAD DATA =================
-market_data = {}
-
-for sec, stocks in SECTORS.items():
-    for sym, token in stocks.items():
-
-        df = get_data(token)
-
-        if df.empty:
-            print(f"⚠️ No data for {sym}")
-            continue
-
-        if len(df) < 50:
-            print(f"⚠️ Insufficient data for {sym}")
-            continue
-
-        market_data[sym] = {
-            "sector": sec,
-            "df": df
-        }
-
-print(f"✅ Loaded {len(market_data)} stocks")
-
-
 # ================= INDICATORS =================
-def rsi(close):
-    if len(close) < 2:
-        return 50
-
-    diff = np.diff(close)
-    gain = np.mean([x for x in diff if x > 0] or [0])
-    loss = np.mean([-x for x in diff if x < 0] or [1])
-
-    if loss == 0:
-        return 100
-
+def rsi(close, period=14):
+    if len(close) < period: return 50
+    delta = np.diff(close)
+    gain = (delta[delta > 0].sum()) / period
+    loss = (-delta[delta < 0].sum()) / period
+    if loss == 0: return 100
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-
-def adx(close):
-    if len(close) < 2:
-        return 0
-    return float(min(np.std(close) * 10, 50))
-
-
-def atr(df):
-    if len(df) < 2:
-        return 0
-
-    tr = []
-    for i in range(1, len(df)):
-        high = float(df.iloc[i]['high'])
-        low = float(df.iloc[i]['low'])
-        prev_close = float(df.iloc[i-1]['close'])
-
-        tr.append(max(high - low, abs(high - prev_close)))
-
-    return float(np.mean(tr)) if tr else 0
-
-
-# ================= BACKTEST =================
+# ================= BACKTEST / LIVE LOGIC =================
 results = []
-
-dates = sorted(set(
-    d for v in market_data.values()
-    for d in v["df"]["date"]
-))
+dates = sorted(set(d for v in market_data.values() for d in v["df"]["date"]))
 
 for day in dates:
-
     sector_strength = {}
     pool = []
 
     for sym, data in market_data.items():
-
-        df = data["df"]
+        stock_df = data["df"] # FIXED: Use the specific stock's DF
         sec = data["sector"]
+        day_df = stock_df[stock_df['date'] == day].sort_values(by="time")
 
-        day_df = df[df['date'] == day]
-
-        if day_df.empty:
-            continue
-
-        day_df = day_df.sort_values(by="time")
-
-        if len(day_df) < 4:
-            continue
+        if len(day_df) < 4: continue
 
         first4 = day_df.iloc[:4]
-
         try:
             open_p = float(first4.iloc[0]['open'])
             ltp = float(first4.iloc[3]['close'])
+            if open_p == 0: continue
+            
+            change = ((ltp - open_p) / open_p) * 100
+            closes = first4['close'].astype(float).values
+
+            # ORB Breakout Logic
+            high_920 = float(first4.iloc[:2]['high'].max())
+            low_920 = float(first4.iloc[:2]['low'].min())
+            breakout = (ltp > high_920) or (ltp < low_920)
+
+            # Volume Spike Logic
+            vol_now = float(first4.iloc[3]['volume'])
+            avg_vol = float(first4.iloc[:3]['volume'].mean())
+            volume_ok = vol_now > (1.5 * avg_vol) if avg_vol > 0 else False
+
+            pool.append({
+                "sym": sym, "sector": sec, "ltp": ltp, "change": change,
+                "rsi": rsi(closes), "breakout": breakout, "volume": volume_ok,
+                "full_day_df": day_df # Store for exit calculation
+            })
+            sector_strength.setdefault(sec, []).append(change)
         except:
             continue
 
-        if open_p == 0:
-            continue
-
-        change = ((ltp - open_p) / open_p) * 100
-        closes = first4['close'].astype(float).values
-
-        # ORB
-        high_920 = float(first4.iloc[:2]['high'].max())
-        low_920 = float(first4.iloc[:2]['low'].min())
-        breakout = (ltp > high_920) or (ltp < low_920)
-
-        # Volume
-        vol_now = float(first4.iloc[3]['volume'])
-        avg_vol = float(first4.iloc[:3]['volume'].mean())
-        volume_ok = vol_now > 1.5 * avg_vol if avg_vol != 0 else False
-
-        pool.append({
-            "sym": sym,
-            "sector": sec,
-            "ltp": ltp,
-            "change": change,
-            "rsi": rsi(closes),
-            "adx": adx(closes),
-            "atr": atr(first4),
-            "breakout": breakout,
-            "volume": volume_ok
-        })
-
-        sector_strength.setdefault(sec, []).append(change)
-
-    if not sector_strength:
-        continue
-
-    sector_strength = {
-        k: sum(v)/len(v)
-        for k, v in sector_strength.items()
-    }
+    # Calculate Signal
+    if not pool: continue
+    
+    # Avg sector performance
+    sector_avg = {k: sum(v)/len(v) for k, v in sector_strength.items()}
 
     signals = []
-
     for s in pool:
-
-        sec_str = sector_strength.get(s["sector"], 0)
+        sec_str = sector_avg.get(s["sector"], 0)
         direction = "BUY" if s["change"] > 0 else "SELL"
-
+        
         score = 0
-
         if abs(sec_str) > 0.7: score += 1
         if abs(s["change"]) > 1: score += 1
-        if s["adx"] > 20: score += 1
         if s["breakout"]: score += 1
         if s["volume"]: score += 1
-
-        if direction == "BUY" and s["rsi"] > 55: score += 1
-        if direction == "SELL" and s["rsi"] < 45: score += 1
+        if (direction == "BUY" and s["rsi"] > 55) or (direction == "SELL" and s["rsi"] < 45):
+            score += 1
 
         if score >= 4:
             signals.append((s, direction))
 
-    if not signals:
-        continue
+    if signals:
+        # Pick best signal and calculate PnL
+        s, direction = sorted(signals, key=lambda x: abs(x[0]["change"]), reverse=True)[0]
+        entry = s["ltp"]
+        exit_price = float(s["full_day_df"].iloc[-1]['close'])
 
-    s, direction = sorted(
-        signals,
-        key=lambda x: abs(x[0]["change"]),
-        reverse=True
-    )[0]
-
-    entry = s["ltp"]
-
-    full_day = df[df['date'] == day].sort_values(by="time")
-
-    if full_day.empty:
-        continue
-
-    exit_price = float(full_day.iloc[-1]['close'])
-
-    if direction == "BUY":
-        pnl = ((exit_price - entry) / entry) * 100
-    else:
-        pnl = ((entry - exit_price) / entry) * 100
-
-    results.append(pnl)
-
+        pnl = ((exit_price - entry) / entry) * 100 if direction == "BUY" else ((entry - exit_price) / entry) * 100
+        results.append(pnl)
+        
+        # Send Alert for the top trade
+        send_telegram_msg(f"🚀 {day} | {s['sym']} | {direction} at {entry} | PnL: {pnl:.2f}%")
 
 # ================= RESULT =================
-total = len(results)
-wins = len([x for x in results if x > 0])
-winrate = (wins / total) * 100 if total else 0
-
-print("\n📊 BACKTEST RESULT (3 Months)\n")
-print("Total Trades:", total)
-print("Win Rate:", round(winrate, 2), "%")
-print("Avg Return:", round(np.mean(results), 2), "%")
+if results:
+    print(f"\n📊 Win Rate: {len([x for x in results if x > 0])/len(results)*100:.2f}%")
