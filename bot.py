@@ -27,55 +27,56 @@ send("🚀 FINAL BACKTEST STARTED (9:30 STRATEGY)")
 
 # ===== SECTORS =====
 SECTORS = {
-    "BANK": {"HDFCBANK":"HDFCBANK","ICICIBANK":"ICICIBANK","SBIN":"SBIN","AXISBANK":"AXISBANK","KOTAKBANK":"KOTAKBANK","INDUSINDBK":"INDUSINDBK"},
-    "IT": {"TCS":"TCS","INFY":"INFY","HCLTECH":"HCLTECH","TECHM":"TECHM","WIPRO":"WIPRO","LTIM":"LTIM"},
-    "AUTO": {"TATAMOTORS":"TATAMOTORS","MARUTI":"MARUTI","M&M":"M&M","BAJAJ-AUTO":"BAJAJ-AUTO","EICHERMOT":"EICHERMOT"},
-    "PHARMA": {"SUNPHARMA":"SUNPHARMA","CIPLA":"CIPLA","DRREDDY":"DRREDDY","DIVISLAB":"DIVISLAB"},
-    "FMCG": {"ITC":"ITC","HINDUNILVR":"HINDUNILVR","NESTLEIND":"NESTLEIND","BRITANNIA":"BRITANNIA"},
-    "METAL": {"TATASTEEL":"TATASTEEL","JSWSTEEL":"JSWSTEEL","HINDALCO":"HINDALCO","VEDL":"VEDL"},
-    "ENERGY": {"RELIANCE":"RELIANCE","ONGC":"ONGC","NTPC":"NTPC","POWERGRID":"POWERGRID"},
-    "NBFC": {"BAJFINANCE":"BAJFINANCE","BAJAJFINSV":"BAJAJFINSV","CHOLAFIN":"CHOLAFIN"},
-    "INFRA": {"LT":"LT","ADANIPORTS":"ADANIPORTS","ADANIENT":"ADANIENT"},
+    "BANK": ["HDFCBANK","ICICIBANK","SBIN","AXISBANK","KOTAKBANK","INDUSINDBK"],
+    "IT": ["TCS","INFY","HCLTECH","TECHM","WIPRO","LTIM"],
+    "AUTO": ["TATAMOTORS","MARUTI","M&M","BAJAJ-AUTO","EICHERMOT"],
+    "PHARMA": ["SUNPHARMA","CIPLA","DRREDDY","DIVISLAB"],
+    "FMCG": ["ITC","HINDUNILVR","NESTLEIND","BRITANNIA"],
+    "METAL": ["TATASTEEL","JSWSTEEL","HINDALCO","VEDL"],
+    "ENERGY": ["RELIANCE","ONGC","NTPC","POWERGRID"],
+    "NBFC": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN"],
+    "INFRA": ["LT","ADANIPORTS","ADANIENT"],
 }
 
-# ================= GET DATA =================
+INDEX = {
+    "NIFTY": "^NSEI",
+    "BANKNIFTY": "^NSEBANK"
+}
+
+# ================= DATA =================
 def get_data(symbol):
-    try:
-        df = yf.download(symbol + ".NS", period="3mo", interval="5m", progress=False)
-
-        if df.empty:
-            return pd.DataFrame()
-
-        df = df.reset_index()
-
-        df.rename(columns={
-            "Datetime":"time",
-            "Open":"open",
-            "High":"high",
-            "Low":"low",
-            "Close":"close",
-            "Volume":"volume"
-        }, inplace=True)
-
-        df['date'] = df['time'].dt.date
-
-        return df
-
-    except:
+    df = yf.download(symbol + ".NS", period="3mo", interval="5m", progress=False)
+    if df.empty:
         return pd.DataFrame()
 
-# ================= LOAD DATA =================
+    df = df.reset_index()
+    df.rename(columns={
+        "Datetime":"time","Open":"open","High":"high",
+        "Low":"low","Close":"close","Volume":"volume"
+    }, inplace=True)
+
+    df['date'] = df['time'].dt.date
+    return df
+
+def get_index(symbol):
+    df = yf.download(symbol, period="3mo", interval="5m", progress=False)
+    df = df.reset_index()
+    df.rename(columns={"Datetime":"time","Open":"open","Close":"close"}, inplace=True)
+    df['date'] = df['time'].dt.date
+    return df
+
+# ================= LOAD =================
 market_data = {}
-
 for sec, stocks in SECTORS.items():
-    for sym in stocks.keys():
-
+    for sym in stocks:
         df = get_data(sym)
-
-        if not df.empty and len(df) > 50:
+        if not df.empty:
             market_data[sym] = {"sector": sec, "df": df}
 
 send(f"✅ Loaded {len(market_data)} stocks")
+
+nifty = get_index(INDEX["NIFTY"])
+banknifty = get_index(INDEX["BANKNIFTY"])
 
 # ================= BACKTEST =================
 results = []
@@ -88,6 +89,23 @@ dates = sorted(set(
 
 for day in dates:
 
+    try:
+        n_df = nifty[nifty['date'] == day].iloc[:4]
+        b_df = banknifty[banknifty['date'] == day].iloc[:4]
+
+        if len(n_df) < 4 or len(b_df) < 4:
+            continue
+
+        n_change = (n_df.iloc[3]['close'] - n_df.iloc[0]['open']) / n_df.iloc[0]['open'] * 100
+        b_change = (b_df.iloc[3]['close'] - b_df.iloc[0]['open']) / b_df.iloc[0]['open'] * 100
+
+    except:
+        continue
+
+    # Skip sideways market
+    if abs(n_change) < 0.3:
+        continue
+
     sector_strength = {}
     pool = []
 
@@ -98,47 +116,74 @@ for day in dates:
 
         day_df = df[df['date'] == day].sort_values(by="time")
 
-        if len(day_df) < 4:
+        if len(day_df) < 6:
             continue
 
-        # ===== 9:30 candle =====
-        first4 = day_df.iloc[:4]
+        first6 = day_df.iloc[:6]
 
-        open_p = first4.iloc[0]['open']
-        ltp = first4.iloc[3]['close']
+        open_p = first6.iloc[0]['open']
+        ltp = first6.iloc[3]['close']
 
         change = ((ltp - open_p) / open_p) * 100
 
+        # ORB
+        high_920 = first6.iloc[:3]['high'].max()
+        low_920 = first6.iloc[:3]['low'].min()
+        breakout = ltp > high_920 or ltp < low_920
+
+        # Volume
+        vol_now = first6.iloc[3]['volume']
+        avg_vol = first6.iloc[:5]['volume'].mean()
+        volume_ok = vol_now > 1.5 * avg_vol if avg_vol != 0 else False
+
         sector_strength.setdefault(sec, []).append(change)
 
-        if abs(change) < 1:
+        if abs(change) < 0.7:
             continue
 
         pool.append({
             "sym": sym,
             "sector": sec,
             "ltp": ltp,
-            "change": change
+            "change": change,
+            "breakout": breakout,
+            "volume": volume_ok
         })
 
-    sector_strength = {
-        k: sum(v) / len(v)
-        for k, v in sector_strength.items() if v
-    }
+    # Sector strength
+    sector_strength = {k: sum(v)/len(v) for k, v in sector_strength.items() if v}
 
-    if not pool:
+    signals = []
+
+    for s in pool:
+
+        sec_str = sector_strength.get(s["sector"], 0)
+        direction = "BUY" if s["change"] > 0 else "SELL"
+
+        score = 0
+
+        if abs(sec_str) > 0.5: score += 1
+        if abs(s["change"]) > 1: score += 1
+        if s["breakout"]: score += 1
+        if s["volume"]: score += 1
+
+        if direction == "BUY" and n_change > 0: score += 1
+        if direction == "SELL" and n_change < 0: score += 1
+
+        if score >= 3:
+            signals.append((s, direction))
+
+    if not signals:
         continue
 
-    # ===== TOP 2 =====
-    pool = sorted(pool, key=lambda x: abs(x['change']), reverse=True)
-    top2 = pool[:2]
+    signals.sort(key=lambda x: abs(x[0]["change"]), reverse=True)
 
-    final = top2[0]
+    top2 = signals[:2]
+    final = top2[0][0]
+    direction = top2[0][1]
 
-    direction = "BUY" if final['change'] > 0 else "SELL"
-    entry = final['ltp']
+    entry = final["ltp"]
 
-    # ===== SL / TP =====
     sl = entry * 0.99 if direction == "BUY" else entry * 1.01
     tp = entry * 1.02 if direction == "BUY" else entry * 0.98
 
@@ -169,7 +214,6 @@ for day in dates:
                 break
 
     results.append(pnl)
-
     logs.append(f"{day} | {direction} {final['sym']} | {result} | {pnl}%")
 
 # ================= RESULT =================
@@ -179,7 +223,7 @@ winrate = (wins / total) * 100 if total else 0
 avg = np.mean(results) if results else 0
 
 summary = f"""
-📊 FINAL BACKTEST (9:30 STRATEGY)
+📊 BACKTEST RESULT (3 Months)
 
 Total Trades: {total}
 Win Rate: {round(winrate,2)}%
@@ -189,4 +233,5 @@ Avg Return: {round(avg,2)}%
 print(summary)
 send(summary)
 
+# Sample trades
 send("🔥 SAMPLE TRADES:\n" + "\n".join(logs[:15]))
