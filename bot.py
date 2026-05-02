@@ -36,7 +36,7 @@ def login():
             if data.get("status"):
                 obj.setAccessToken(data['data']['jwtToken'])
                 session_time = datetime.now()
-                print("✅ Login Success")
+                print("Login Success")
                 return obj
         except:
             time.sleep(3)
@@ -44,17 +44,17 @@ def login():
     raise Exception("Login Failed")
 
 obj = login()
-send("🚀 BACKTEST STARTED")
+send("🚀 BACKTEST STARTED (30 Days)")
 
-# ========= DATE (SAFE LAST 3 MONTHS) =========
+# ========= LAST 30 DAYS =========
 today = datetime.now()
 
-# Fix wrong system clock (if server shows future year)
+# safety if server clock is wrong
 if today.year > 2025:
     today = datetime(2025, 4, 30)
 
 end = today
-start = end - timedelta(days=90)
+start = end - timedelta(days=30)
 
 # ========= YOUR CONFIG =========
 SECTORS = {
@@ -82,11 +82,10 @@ def get_data(token):
     current = start
 
     while current < end:
-        nxt = current + timedelta(days=1)   # ✅ smaller chunk
+        nxt = current + timedelta(days=1)
 
         # refresh session every 5 mins
         if session_time and (datetime.now() - session_time).seconds > 300:
-            print("♻️ Refreshing session")
             obj = login()
 
         try:
@@ -98,10 +97,9 @@ def get_data(token):
                 "todate": nxt.strftime("%Y-%m-%d 15:30")
             })
 
-            # handle invalid token properly
             if res and res.get("errorCode") == "AG8001":
-                print("🔁 Token expired → waiting before relogin")
-                time.sleep(5)
+                print("Token issue → wait + relogin")
+                time.sleep(6)
                 obj = login()
                 continue
 
@@ -113,7 +111,8 @@ def get_data(token):
 
         current = nxt
 
-        time.sleep(2.0)   # ✅ CRITICAL FIX (rate limit)
+        # 🔥 KEY FIX: slow calls
+        time.sleep(2.2)
 
     if not all_data:
         return pd.DataFrame()
@@ -138,11 +137,10 @@ for name, tok in INDICES.items():
     if not df.empty:
         index_data[name] = df
 
-send(f"✅ Loaded {len(market)} stocks")
+send(f"Loaded {len(market)} stocks")
 
 # ========= BACKTEST =========
 results = []
-logs = []
 
 dates = sorted(set(d for v in market.values() for d in v["df"]["date"]))
 
@@ -182,13 +180,7 @@ for day in dates:
 
         sector_strength.setdefault(sec, []).append(change)
 
-        pool.append({
-            "sym": sym,
-            "sector": sec,
-            "change": change,
-            "ltp": close_930,
-            "df": day_df
-        })
+        pool.append((sym, sec, change, close_930, day_df))
 
     if not pool:
         continue
@@ -196,36 +188,33 @@ for day in dates:
     sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
 
     signals = []
-    for s in pool:
-        sec_str = sector_strength.get(s["sector"], 0)
+    for sym, sec, change, ltp, df in pool:
+        sec_str = sector_strength.get(sec, 0)
 
-        if abs(s["change"]) < 0.7:
+        if abs(change) < 0.7:
             continue
-
-        if (s["change"] > 0 and index_dir < 0) or (s["change"] < 0 and index_dir > 0):
+        if (change > 0 and index_dir < 0) or (change < 0 and index_dir > 0):
             continue
-
         if abs(sec_str) < 0.3:
             continue
 
-        signals.append(s)
+        signals.append((sym, change, ltp, df))
 
     if not signals:
         continue
 
-    signals.sort(key=lambda x: abs(x["change"]), reverse=True)
+    signals.sort(key=lambda x: abs(x[1]), reverse=True)
 
-    final = signals[0]
+    sym, change, entry, df = signals[0]
 
-    direction = "BUY" if final["change"] > 0 else "SELL"
-    entry = final["ltp"]
+    direction = "BUY" if change > 0 else "SELL"
 
     sl = entry * 0.99 if direction == "BUY" else entry * 1.01
     tp = entry * 1.02 if direction == "BUY" else entry * 0.98
 
     pnl = 0
 
-    for _, row in final["df"].iterrows():
+    for _, row in df.iterrows():
         if direction == "BUY":
             if row['high'] >= tp:
                 pnl = 2; break
@@ -238,7 +227,6 @@ for day in dates:
                 pnl = -1; break
 
     results.append(pnl)
-    logs.append(f"{day} | {direction} {final['sym']} | {pnl}%")
 
 # ========= RESULT =========
 total = len(results)
@@ -246,7 +234,7 @@ wins = len([x for x in results if x > 0])
 winrate = (wins / total) * 100 if total else 0
 
 msg = f"""
-📊 BACKTEST RESULT
+📊 BACKTEST RESULT (30 DAYS)
 
 Trades: {total}
 Win Rate: {round(winrate,2)}%
@@ -254,4 +242,3 @@ Win Rate: {round(winrate,2)}%
 
 print(msg)
 send(msg)
-send("\n".join(logs[:10]))
