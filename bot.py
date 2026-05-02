@@ -67,28 +67,38 @@ def get_data(token):
     while current < end:
         nxt = current + timedelta(days=5)
 
-        try:
-            res = obj.getCandleData({
-                "exchange": "NSE",
-                "symboltoken": token,
-                "interval": "FIVE_MINUTE",
-                "fromdate": current.strftime("%Y-%m-%d 09:15"),
-                "todate": nxt.strftime("%Y-%m-%d 15:30")
-            })
+        retry = 0
+        success = False
 
-            # 🔴 TOKEN EXPIRED → RELOGIN
-            if res and res.get("errorCode") == "AG8001":
-                print("🔁 Token expired → Re-login")
+        while retry < 3:
+            try:
+                res = obj.getCandleData({
+                    "exchange": "NSE",
+                    "symboltoken": token,
+                    "interval": "FIVE_MINUTE",
+                    "fromdate": current.strftime("%Y-%m-%d 09:15"),
+                    "todate": nxt.strftime("%Y-%m-%d 15:30")
+                })
 
-                obj = login()
+                # 🔴 TOKEN EXPIRED
+                if res and res.get("errorCode") == "AG8001":
+                    print("🔁 Token expired → Re-login")
+                    obj = login()
+                    retry += 1
+                    continue
 
-                continue  # retry same chunk
+                if res and 'data' in res and res['data']:
+                    all_data.extend(res['data'])
 
-            if res and 'data' in res and res['data']:
-                all_data.extend(res['data'])
+                success = True
+                break
 
-        except Exception as e:
-            print("API Error:", e)
+            except Exception as e:
+                print("API Error:", e)
+                retry += 1
+
+        if not success:
+            print(f"⚠️ Skipping chunk: {current} → {nxt}")
 
         current = nxt
         time.sleep(0.2)
@@ -103,6 +113,8 @@ def get_data(token):
     return df
 
 # ================= LOAD =================
+print(f"Fetching {sym}...")
+
 market = {}
 
 for sec, stocks in SECTORS.items():
