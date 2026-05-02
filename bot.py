@@ -62,7 +62,6 @@ SECTORS = {
 # ===== DATE RANGE =====
 end = datetime.now()
 start = end - timedelta(days=90)
-
 # ================= GET DATA =================
 def get_data(token):
 
@@ -77,17 +76,26 @@ def get_data(token):
 
         res = obj.getCandleData(params)
 
-        # ===== SAFETY =====
-        if not res or 'data' not in res or not res['data']:
+        # ===== HARD CHECK =====
+        if not isinstance(res, dict):
+            return pd.DataFrame()
+
+        if 'data' not in res or res['data'] is None:
+            return pd.DataFrame()
+
+        if len(res['data']) == 0:
             return pd.DataFrame()
 
         df = pd.DataFrame(res['data'])
 
-        # Fix columns dynamically
+        # Handle variable column count
+        if df.shape[1] < 6:
+            return pd.DataFrame()
+
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
 
-        # ===== TYPE FIX =====
+        # ===== SAFE TYPE CONVERSION =====
         df['time'] = pd.to_datetime(df['time'], errors='coerce')
 
         for col in ["open","high","low","close","volume"]:
@@ -103,7 +111,7 @@ def get_data(token):
         return df
 
     except Exception as e:
-        print(f"❌ Error in token {token}: {e}")
+        print(f"❌ Error fetching {token}: {e}")
         return pd.DataFrame()
 
 
@@ -115,12 +123,12 @@ for sec, stocks in SECTORS.items():
 
         df = get_data(token)
 
-        if df.empty:
+        if df is None or df.empty:
             print(f"⚠️ No data for {sym}")
             continue
 
         if len(df) < 50:
-            print(f"⚠️ Not enough data for {sym}")
+            print(f"⚠️ Insufficient data for {sym}")
             continue
 
         market_data[sym] = {
@@ -128,24 +136,29 @@ for sec, stocks in SECTORS.items():
             "df": df
         }
 
-print(f"✅ Loaded {len(market_data)} stocks successfully")
+print(f"✅ Loaded {len(market_data)} stocks")
 
 
 # ================= INDICATORS =================
 def rsi(close):
     if len(close) < 2:
         return 50
+
     diff = np.diff(close)
     gain = np.mean([x for x in diff if x > 0] or [0])
     loss = np.mean([-x for x in diff if x < 0] or [1])
-    rs = gain / loss if loss else 1
+
+    if loss == 0:
+        return 100
+
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 
 def adx(close):
     if len(close) < 2:
         return 0
-    return min(np.std(close) * 10, 50)
+    return float(min(np.std(close) * 10, 50))
 
 
 def atr(df):
@@ -154,13 +167,13 @@ def atr(df):
 
     tr = []
     for i in range(1, len(df)):
-        high = df.iloc[i]['high']
-        low = df.iloc[i]['low']
-        prev_close = df.iloc[i-1]['close']
+        high = float(df.iloc[i]['high'])
+        low = float(df.iloc[i]['low'])
+        prev_close = float(df.iloc[i-1]['close'])
 
         tr.append(max(high - low, abs(high - prev_close)))
 
-    return np.mean(tr) if tr else 0
+    return float(np.mean(tr)) if tr else 0
 
 
 # ================= BACKTEST =================
@@ -181,10 +194,9 @@ for day in dates:
         df = data["df"]
         sec = data["sector"]
 
-        # ===== DAY DATA =====
-        day_df = df[df['date'] == day].copy()
+        day_df = df[df['date'] == day]
 
-        if day_df.empty:
+        if day_df is None or day_df.empty:
             continue
 
         day_df = day_df.sort_values(by="time")
@@ -192,25 +204,34 @@ for day in dates:
         if len(day_df) < 4:
             continue
 
-        # Take first 4 candles safely
-        first4 = day_df.head(4)
+        first4 = day_df.iloc[:4]
 
-        open_p = first4.iloc[0]['open']
-        ltp = first4.iloc[-1]['close']
+        try:
+            open_p = float(first4.iloc[0]['open'])
+            ltp = float(first4.iloc[3]['close'])
+        except:
+            continue
+
+        if open_p == 0:
+            continue
 
         change = ((ltp - open_p) / open_p) * 100
 
-        closes = first4['close'].values
+        closes = first4['close'].astype(float).values
 
         # ===== ORB =====
-        high_920 = first4.iloc[:2]['high'].max()
-        low_920 = first4.iloc[:2]['low'].min()
-        breakout = ltp > high_920 or ltp < low_920
+        high_920 = float(first4.iloc[:2]['high'].max())
+        low_920 = float(first4.iloc[:2]['low'].min())
+        breakout = (ltp > high_920) or (ltp < low_920)
 
         # ===== VOLUME =====
-        vol_now = first4.iloc[-1]['volume']
-        avg_vol = first4.iloc[:3]['volume'].mean()
-        volume_ok = vol_now > 1.5 * avg_vol
+        vol_now = float(first4.iloc[3]['volume'])
+        avg_vol = float(first4.iloc[:3]['volume'].mean())
+
+        if avg_vol == 0:
+            volume_ok = False
+        else:
+            volume_ok = vol_now > 1.5 * avg_vol
 
         pool.append({
             "sym": sym,
@@ -226,13 +247,14 @@ for day in dates:
 
         sector_strength.setdefault(sec, []).append(change)
 
-    # ===== SECTOR STRENGTH =====
+    if not sector_strength:
+        continue
+
     sector_strength = {
         k: sum(v)/len(v)
-        for k, v in sector_strength.items() if v
+        for k, v in sector_strength.items()
     }
 
-    # ===== SIGNAL FILTER =====
     signals = []
 
     for s in pool:
@@ -257,22 +279,26 @@ for day in dates:
     if not signals:
         continue
 
-    # ===== PICK BEST =====
-    s, direction = sorted(
-        signals,
-        key=lambda x: abs(x[0]["change"]),
-        reverse=True
-    )[0]
+    best = sorted(signals, key=lambda x: abs(x[0]["change"]), reverse=True)[0]
+
+    s, direction = best
 
     entry = s["ltp"]
 
-    # ===== EXIT PRICE (FULL DAY FIX) =====
-    full_day = df[df['date'] == day].sort_values(by="time")
+    full_day = df[df['date'] == day]
 
-    if full_day.empty:
+    if full_day is None or full_day.empty:
         continue
 
-    exit_price = full_day.iloc[-1]['close']
+    full_day = full_day.sort_values(by="time")
+
+    try:
+        exit_price = float(full_day.iloc[-1]['close'])
+    except:
+        continue
+
+    if entry == 0:
+        continue
 
     if direction == "BUY":
         pnl = ((exit_price - entry) / entry) * 100
@@ -282,7 +308,7 @@ for day in dates:
     results.append(pnl)
 
 
-# ================= FINAL RESULT =================
+# ================= RESULT =================
 total = len(results)
 wins = len([x for x in results if x > 0])
 winrate = (wins / total) * 100 if total else 0
