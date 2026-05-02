@@ -42,38 +42,55 @@ SECTORS = {
     "INFRA": {"LT":"11483","ADANIPORTS":"15083","ADANIENT":"25"},
 }
 
-# ================= GET DATA =================
 def get_data(token):
-    try:
-        params = {
-            "exchange":"NSE",
-            "symboltoken":token,
-            "interval":"FIVE_MINUTE",
-            "fromdate":start.strftime("%Y-%m-%d 09:15"),
-            "todate":end.strftime("%Y-%m-%d 15:30")
-        }
 
-        res = obj.getCandleData(params)
+    all_data = []
 
-        if not res or 'data' not in res or not res['data']:
-            return pd.DataFrame()
+    current_start = start
 
-        df = pd.DataFrame(res['data'])
-        df = df.iloc[:, :6]
-        df.columns = ["time","open","high","low","close","volume"]
+    while current_start < end:
 
-        df['time'] = pd.to_datetime(df['time'])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        current_end = current_start + timedelta(days=7)
 
-        df = df.dropna()
-        df['date'] = df['time'].dt.date
+        if current_end > end:
+            current_end = end
 
-        return df
+        try:
+            params = {
+                "exchange": "NSE",
+                "symboltoken": token,
+                "interval": "FIVE_MINUTE",
+                "fromdate": current_start.strftime("%Y-%m-%d 09:15"),
+                "todate": current_end.strftime("%Y-%m-%d 15:30")
+            }
 
-    except:
+            res = obj.getCandleData(params)
+
+            if res and 'data' in res and res['data']:
+                all_data.extend(res['data'])
+
+        except:
+            pass
+
+        current_start = current_end
+
+    if not all_data:
         return pd.DataFrame()
 
+    df = pd.DataFrame(all_data)
+
+    df = df.iloc[:, :6]
+    df.columns = ["time","open","high","low","close","volume"]
+
+    df['time'] = pd.to_datetime(df['time'], errors='coerce')
+
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df = df.dropna()
+    df['date'] = df['time'].dt.date
+
+    return df
 # ================= LOAD =================
 market_data = {}
 
