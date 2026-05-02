@@ -60,6 +60,12 @@ SECTORS = {
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
 }
 
+# ========= INDEX TOKENS =========
+INDICES = {
+    "NIFTY": "99926000",
+    "BANKNIFTY": "99926009"
+}
+
 # ========= INDICATORS =========
 def rsi(closes):
     diff = np.diff(closes)
@@ -91,11 +97,69 @@ def get_candles(client, token):
     data = client.getCandleData(params)
     return data["data"] if data["data"] else []
 
-# ========= CORE =========
+# ========= INDEX CONFIRMATION =========
+def get_index_bias(client):
+    bias = {}
+
+    for name, token in INDICES.items():
+        try:
+            data = client.ltpData("NSE", name, token)['data']
+            change = ((data['ltp'] - data['open']) / data['open']) * 100
+            bias[name] = change
+        except:
+            bias[name] = 0
+
+    return bias
+
+# ========= PREMARKET =========
+def premarket_summary(client):
+
+    sector_strength = {}
+    movers = []
+
+    for sec, stocks in SECTORS.items():
+        changes = []
+
+        for sym, tok in stocks.items():
+            try:
+                data = client.ltpData("NSE", sym, tok)['data']
+                change = ((data['ltp'] - data['open']) / data['open']) * 100
+
+                changes.append(change)
+                movers.append((sym, change))
+            except:
+                pass
+
+        if changes:
+            sector_strength[sec] = sum(changes)/len(changes)
+
+    top_sec = sorted(sector_strength.items(), key=lambda x:x[1], reverse=True)[:3]
+    top_stocks = sorted(movers, key=lambda x:abs(x[1]), reverse=True)[:3]
+
+    index_bias = get_index_bias(client)
+
+    msg = "📊 PRE-MARKET SUMMARY\n\n"
+
+    msg += "Top Sectors:\n"
+    for s,v in top_sec:
+        msg += f"{s} {round(v,2)}%\n"
+
+    msg += "\nTop Movers:\n"
+    for s,v in top_stocks:
+        msg += f"{s} {round(v,2)}%\n"
+
+    msg += f"\nNIFTY: {round(index_bias['NIFTY'],2)}%"
+    msg += f"\nBANKNIFTY: {round(index_bias['BANKNIFTY'],2)}%"
+
+    send(msg)
+
+# ========= MAIN STRATEGY =========
 def run(client):
 
     sector_strength={}
     pool=[]
+
+    index_bias = get_index_bias(client)
 
     for sec,stocks in SECTORS.items():
         changes=[]
@@ -110,16 +174,14 @@ def run(client):
 
             closes=[x[4] for x in candles]
 
-            # ===== ORB =====
+            # ORB
             high_920=max([c[2] for c in candles[:2]])
             low_920=min([c[3] for c in candles[:2]])
+            breakout = ltp > high_920 or ltp < low_920
 
-            breakout = (ltp > high_920) or (ltp < low_920)
-
-            # ===== VOLUME =====
+            # Volume
             vol_now=candles[-1][5]
             avg_vol=np.mean([c[5] for c in candles[:-1]])
-
             volume_ok = vol_now > 1.5 * avg_vol
 
             pool.append({
@@ -155,13 +217,13 @@ def run(client):
         if s["breakout"]: score+=1
         if s["volume"]: score+=1
 
-        if direction=="BUY" and s["rsi"]>55: score+=1
-        if direction=="SELL" and s["rsi"]<45: score+=1
+        # INDEX CONFIRMATION
+        if direction=="BUY" and index_bias["NIFTY"]>0: score+=1
+        if direction=="SELL" and index_bias["NIFTY"]<0: score+=1
 
         if score>=4:
             signals.append((s,sec_str,direction,score))
 
-    # ===== TOP 2 =====
     signals.sort(key=lambda x:x[3], reverse=True)
     top2=signals[:2]
 
@@ -192,7 +254,7 @@ def run(client):
         tp2=ltp-risk*3
         option="PE"
 
-    strike = round(ltp / 50) * 50  # ATM strike
+    strike = round(ltp / 50) * 50
 
     final_msg=f"""
 {direction} {s['sym']} [A+]
@@ -210,16 +272,22 @@ Time: 09:30 IST
 """
     send(final_msg)
 
-# ========= DAILY LOOP =========
-client=login()
-last=None
+# ========= LOOP =========
+client = login()
+last_915=None
+last_930=None
 
 while True:
     now=datetime.now()
 
-    if now.strftime("%H:%M")=="09:30":
-        if last!=now.date():
-            run(client)
-            last=now.date()
+    if now.hour==9 and now.minute==15:
+        if last_915!=now.date():
+            premarket_summary(client)
+            last_915=now.date()
 
-    time.sleep(20)
+    if now.hour==9 and now.minute==30:
+        if last_930!=now.date():
+            run(client)
+            last_930=now.date()
+
+    time.sleep(10)
