@@ -6,7 +6,7 @@ import pyotp
 import numpy as np
 
 # ===== TELEGRAM =====
-TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
+TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
 CHAT_ID = "890425913"
 
 def send(msg):
@@ -59,149 +59,116 @@ SECTORS = {
     "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
 }
+# ===== DATE RANGE =====
+end = datetime.now()
+start = end - timedelta(days=90)
 
-# ========= INDEX TOKENS =========
-INDICES = {
-    "NIFTY": "99926000",
-    "BANKNIFTY": "99926009"
-}
-
-# ========= INDICATORS =========
-def rsi(closes):
-    diff = np.diff(closes)
-    gain = np.mean([x for x in diff if x > 0] or [0])
-    loss = np.mean([-x for x in diff if x < 0] or [1])
-    rs = gain / loss if loss else 1
-    return 100 - (100 / (1 + rs))
-
-def adx(c):
-    closes = [x[4] for x in c]
-    return min(np.std(closes)*10, 50)
-
-def atr(c):
-    tr=[]
-    for i in range(1,len(c)):
-        tr.append(max(c[i][2]-c[i][3],abs(c[i][2]-c[i-1][4])))
-    return np.mean(tr) if tr else 0
-
-# ========= DATA =========
-def get_candles(client, token):
-    now = datetime.now()
+# ===== GET DATA =====
+def get_data(token):
     params = {
         "exchange":"NSE",
         "symboltoken":token,
         "interval":"FIVE_MINUTE",
-        "fromdate":now.strftime("%Y-%m-%d 09:15"),
-        "todate":now.strftime("%Y-%m-%d 09:35")
+        "fromdate":start.strftime("%Y-%m-%d 09:15"),
+        "todate":end.strftime("%Y-%m-%d 15:30")
     }
-    data = client.getCandleData(params)
-    return data["data"] if data["data"] else []
 
-# ========= INDEX CONFIRMATION =========
-def get_index_bias(client):
-    bias = {}
+    data = obj.getCandleData(params)
 
-    for name, token in INDICES.items():
-        try:
-            data = client.ltpData("NSE", name, token)['data']
-            change = ((data['ltp'] - data['open']) / data['open']) * 100
-            bias[name] = change
-        except:
-            bias[name] = 0
+    if not data['data']:
+        return pd.DataFrame()
 
-    return bias
+    df = pd.DataFrame(data['data'],
+                      columns=["time","open","high","low","close","volume"])
+    df['time'] = pd.to_datetime(df['time'])
+    df['date'] = df['time'].dt.date
+    return df
 
-# ========= PREMARKET =========
-def premarket_summary(client):
+# ===== INDICATORS =====
+def rsi(close):
+    diff = np.diff(close)
+    gain = np.mean([x for x in diff if x > 0] or [0])
+    loss = np.mean([-x for x in diff if x < 0] or [1])
+    rs = gain/loss if loss else 1
+    return 100 - (100/(1+rs))
 
-    sector_strength = {}
-    movers = []
+def adx(close):
+    return min(np.std(close)*10,50)
 
-    for sec, stocks in SECTORS.items():
-        changes = []
+def atr(df):
+    tr=[]
+    for i in range(1,len(df)):
+        tr.append(max(df.iloc[i]['high']-df.iloc[i]['low'],
+                      abs(df.iloc[i]['high']-df.iloc[i-1]['close'])))
+    return np.mean(tr) if tr else 0
 
-        for sym, tok in stocks.items():
-            try:
-                data = client.ltpData("NSE", sym, tok)['data']
-                change = ((data['ltp'] - data['open']) / data['open']) * 100
+# ===== LOAD DATA =====
+market_data = {}
 
-                changes.append(change)
-                movers.append((sym, change))
-            except:
-                pass
+for sec,stocks in SECTORS.items():
+    for sym,token in stocks.items():
+        df = get_data(token)
+        if not df.empty:
+            market_data[sym] = {"sector":sec,"df":df}
 
-        if changes:
-            sector_strength[sec] = sum(changes)/len(changes)
+# ===== BACKTEST =====
+results = []
 
-    top_sec = sorted(sector_strength.items(), key=lambda x:x[1], reverse=True)[:3]
-    top_stocks = sorted(movers, key=lambda x:abs(x[1]), reverse=True)[:3]
+dates = sorted(set(
+    d for v in market_data.values()
+    for d in v["df"]["date"]
+))
 
-    index_bias = get_index_bias(client)
-
-    msg = "📊 PRE-MARKET SUMMARY\n\n"
-
-    msg += "Top Sectors:\n"
-    for s,v in top_sec:
-        msg += f"{s} {round(v,2)}%\n"
-
-    msg += "\nTop Movers:\n"
-    for s,v in top_stocks:
-        msg += f"{s} {round(v,2)}%\n"
-
-    msg += f"\nNIFTY: {round(index_bias['NIFTY'],2)}%"
-    msg += f"\nBANKNIFTY: {round(index_bias['BANKNIFTY'],2)}%"
-
-    send(msg)
-
-# ========= MAIN STRATEGY =========
-def run(client):
+for day in dates:
 
     sector_strength={}
     pool=[]
 
-    index_bias = get_index_bias(client)
+    for sym,data in market_data.items():
 
-    for sec,stocks in SECTORS.items():
-        changes=[]
+        df=data["df"]
+        sec=data["sector"]
 
-        for sym,tok in stocks.items():
-            candles=get_candles(client,tok)
-            if len(candles)<4: continue
+        day_df = df[df['date']==day]
 
-            open_p=candles[0][1]
-            ltp=candles[-1][4]
-            change=((ltp-open_p)/open_p)*100
+        if len(day_df)<4:
+            continue
 
-            closes=[x[4] for x in candles]
+        open_p = day_df.iloc[0]['open']
+        ltp = day_df.iloc[3]['close']
 
-            # ORB
-            high_920=max([c[2] for c in candles[:2]])
-            low_920=min([c[3] for c in candles[:2]])
-            breakout = ltp > high_920 or ltp < low_920
+        change = ((ltp-open_p)/open_p)*100
 
-            # Volume
-            vol_now=candles[-1][5]
-            avg_vol=np.mean([c[5] for c in candles[:-1]])
-            volume_ok = vol_now > 1.5 * avg_vol
+        closes = day_df['close'].values[:4]
 
-            pool.append({
-                "sym":sym,
-                "sector":sec,
-                "ltp":ltp,
-                "change":change,
-                "rsi":rsi(closes),
-                "adx":adx(candles),
-                "atr":atr(candles),
-                "breakout":breakout,
-                "volume":volume_ok
-            })
+        # ORB
+        high_920 = day_df.iloc[:2]['high'].max()
+        low_920 = day_df.iloc[:2]['low'].min()
 
-            changes.append(change)
+        breakout = ltp > high_920 or ltp < low_920
 
-        if changes:
-            sector_strength[sec]=sum(changes)/len(changes)
+        # volume
+        vol_now = day_df.iloc[3]['volume']
+        avg_vol = day_df.iloc[:3]['volume'].mean()
 
-    # ===== FILTER =====
+        volume_ok = vol_now > 1.5 * avg_vol
+
+        pool.append({
+            "sym":sym,
+            "sector":sec,
+            "ltp":ltp,
+            "change":change,
+            "rsi":rsi(closes),
+            "adx":adx(closes),
+            "atr":atr(day_df.iloc[:4]),
+            "breakout":breakout,
+            "volume":volume_ok
+        })
+
+        sector_strength.setdefault(sec, []).append(change)
+
+    sector_strength = {k:sum(v)/len(v) for k,v in sector_strength.items() if v}
+
     signals=[]
 
     for s in pool:
@@ -217,77 +184,34 @@ def run(client):
         if s["breakout"]: score+=1
         if s["volume"]: score+=1
 
-        # INDEX CONFIRMATION
-        if direction=="BUY" and index_bias["NIFTY"]>0: score+=1
-        if direction=="SELL" and index_bias["NIFTY"]<0: score+=1
+        if direction=="BUY" and s["rsi"]>55: score+=1
+        if direction=="SELL" and s["rsi"]<45: score+=1
 
         if score>=4:
-            signals.append((s,sec_str,direction,score))
+            signals.append((s,direction))
 
-    signals.sort(key=lambda x:x[3], reverse=True)
-    top2=signals[:2]
+    if not signals:
+        continue
 
-    if not top2:
-        send("⚠️ No strong trades today")
-        return
+    # pick best
+    s,direction = sorted(signals, key=lambda x:abs(x[0]["change"]), reverse=True)[0]
 
-    # ===== SEND TOP 2 =====
-    msg="📊 TOP 2 STOCKS\n\n"
-    for s,sec_str,direction,_ in top2:
-        msg+=f"{direction} {s['sym']} ({s['sector']})\n"
-    send(msg)
-
-    # ===== FINAL PICK =====
-    s,sec_str,direction,_=top2[0]
-
-    ltp=s["ltp"]
-    risk=s["atr"]
+    entry = s["ltp"]
+    exit_price = day_df.iloc[-1]['close']
 
     if direction=="BUY":
-        sl=ltp-risk
-        tp1=ltp+risk*1.5
-        tp2=ltp+risk*3
-        option="CE"
+        pnl = ((exit_price-entry)/entry)*100
     else:
-        sl=ltp+risk
-        tp1=ltp-risk*1.5
-        tp2=ltp-risk*3
-        option="PE"
+        pnl = ((entry-exit_price)/entry)*100
 
-    strike = round(ltp / 50) * 50
+    results.append(pnl)
 
-    final_msg=f"""
-{direction} {s['sym']} [A+]
-Sector: {s['sector']} ({round(sec_str,2)}%)
+# ===== RESULT =====
+total = len(results)
+wins = len([x for x in results if x>0])
+winrate = (wins/total)*100 if total else 0
 
-Option: {s['sym']} {strike} {option}
-
-Entry  : ₹{round(ltp,2)}
-SL     : ₹{round(sl,2)}
-TP1    : ₹{round(tp1,2)}  (1:1.5)
-TP2    : ₹{round(tp2,2)}  (1:3)
-
-RSI: {round(s['rsi'],2)} | ADX: {round(s['adx'],2)}
-Time: 09:30 IST
-"""
-    send(final_msg)
-
-# ========= LOOP =========
-client = login()
-last_915=None
-last_930=None
-
-while True:
-    now=datetime.now()
-
-    if now.hour==9 and now.minute==15:
-        if last_915!=now.date():
-            premarket_summary(client)
-            last_915=now.date()
-
-    if now.hour==9 and now.minute==30:
-        if last_930!=now.date():
-            run(client)
-            last_930=now.date()
-
-    time.sleep(10)
+print("\n📊 BACKTEST RESULT (3 Months)\n")
+print("Total Trades:", total)
+print("Win Rate:", round(winrate,2), "%")
+print("Avg Return:", round(np.mean(results),2), "%")
