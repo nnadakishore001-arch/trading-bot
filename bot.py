@@ -6,30 +6,30 @@ import pyotp
 import requests
 
 # ===== TELEGRAM =====
-TOKEN = "YOUR_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
+CHAT_ID = "890425913"
 
 def send(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
 # ===== LOGIN =====
-API_KEY = "YOUR_API"
-CLIENT_ID = "YOUR_ID"
-PASSWORD = "YOUR_PASS"
-TOTP_SECRET = "YOUR_TOTP"
+API_KEY = "VYFnGUA8"
+CLIENT_ID = "M373866"
+PASSWORD = "0917"
+TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
 obj = SmartConnect(api_key=API_KEY)
 totp = pyotp.TOTP(TOTP_SECRET).now()
 obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-send("📊 PRO Backtest Started...")
+send("🚀 PRO BACKTEST STARTED")
 
 # ===== DATE RANGE =====
 end = datetime.now()
 start = end - timedelta(days=90)
 
-# ===== YOUR FULL SECTORS =====
+# ===== SECTORS =====
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922","INDUSINDBK":"5258"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787","LTIM":"17818"},
@@ -52,7 +52,6 @@ def get_data(token):
             "fromdate":start.strftime("%Y-%m-%d 09:15"),
             "todate":end.strftime("%Y-%m-%d 15:30")
         }
-
         res = obj.getCandleData(params)
 
         if not res or 'data' not in res or not res['data']:
@@ -62,20 +61,18 @@ def get_data(token):
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
 
-        df['time'] = pd.to_datetime(df['time'], errors='coerce')
-
+        df['time'] = pd.to_datetime(df['time'])
         for col in ["open","high","low","close","volume"]:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df = df.dropna()
         df['date'] = df['time'].dt.date
-
         return df
 
     except:
         return pd.DataFrame()
 
-# ================= LOAD DATA =================
+# ================= LOAD =================
 market_data = {}
 
 for sec, stocks in SECTORS.items():
@@ -98,13 +95,6 @@ def adx(c):
     closes = [x[4] for x in c]
     return min(np.std(closes)*10, 50)
 
-def atr(df):
-    tr=[]
-    for i in range(1,len(df)):
-        tr.append(max(df.iloc[i]['high']-df.iloc[i]['low'],
-                      abs(df.iloc[i]['high']-df.iloc[i-1]['close'])))
-    return np.mean(tr) if tr else 0
-
 def vwap(df):
     pv = ((df['high']+df['low']+df['close'])/3 * df['volume']).sum()
     vol = df['volume'].sum()
@@ -112,6 +102,7 @@ def vwap(df):
 
 # ================= BACKTEST =================
 results = []
+trade_logs = []
 
 dates = sorted(set(
     d for v in market_data.values()
@@ -136,8 +127,14 @@ for day in dates:
         first6 = day_df.iloc[:6]
 
         open_p = first6.iloc[0]['open']
-        ltp = first6.iloc[3]['close']
+        prev_close = df[df['date'] < day]['close'].iloc[-1] if len(df[df['date'] < day])>0 else open_p
 
+        # ===== GAP FILTER =====
+        gap = ((open_p - prev_close)/prev_close)*100
+        if abs(gap) < 0.5:
+            continue
+
+        ltp = first6.iloc[3]['close']
         change=((ltp-open_p)/open_p)*100
 
         closes = first6['close'].values
@@ -183,13 +180,10 @@ for day in dates:
         if direction=="BUY" and s["ltp"]>s["vwap"]: score+=1
         if direction=="SELL" and s["ltp"]<s["vwap"]: score+=1
 
-        if direction=="BUY" and s["rsi"]>55 and s["adx"]>20: score+=1
-        if direction=="SELL" and s["rsi"]<45 and s["adx"]>20: score+=1
+        if direction=="BUY" and s["rsi"]>60 and s["adx"]>25: score+=1
+        if direction=="SELL" and s["rsi"]<40 and s["adx"]>25: score+=1
 
-        if direction=="BUY" and sec_str>0: score+=1
-        if direction=="SELL" and sec_str<0: score+=1
-
-        if score>=4:
+        if score>=5:
             signals.append((s,direction))
 
     if not signals:
@@ -199,30 +193,42 @@ for day in dates:
 
     entry = s["ltp"]
 
-    full_day = df[df['date']==day]
+    full_day = df[df['date']==day].sort_values(by="time")
 
-    if full_day.empty:
-        continue
+    tp = entry * 1.015
+    sl = entry * 0.99
 
-    exit_price = full_day.iloc[-1]['close']
+    pnl = 0
+    for _, row in full_day.iterrows():
 
-    pnl = ((exit_price-entry)/entry)*100 if direction=="BUY" else ((entry-exit_price)/entry)*100
+        if row['time'].hour >= 10 and row['time'].minute >= 30:
+            break  # TIME EXIT
+
+        if direction=="BUY":
+            if row['high'] >= tp:
+                pnl = 1.5
+                break
+            elif row['low'] <= sl:
+                pnl = -1
+                break
+
+        else:
+            if row['low'] <= entry*0.985:
+                pnl = 1.5
+                break
+            elif row['high'] >= entry*1.01:
+                pnl = -1
+                break
 
     results.append(pnl)
+    trade_logs.append(f"{day} | {direction} {s['sym']} | {pnl}%")
 
 # ================= RESULT =================
 total = len(results)
-wins = len([x for x in results if x>0])
+wins = len([x for x in results if x > 0])
 winrate = (wins/total)*100 if total else 0
 avg = np.mean(results) if results else 0
 
-msg = f"""
-📊 PRO BACKTEST RESULT (3 Months)
+send(f"📊 RESULT\nTrades: {total}\nWin Rate: {round(winrate,2)}%\nAvg: {round(avg,2)}%")
 
-Total Trades: {total}
-Win Rate: {round(winrate,2)}%
-Avg Return: {round(avg,2)}%
-"""
-
-print(msg)
-send(msg)
+send("🔥 SAMPLE TRADES:\n" + "\n".join(trade_logs[:10]))
