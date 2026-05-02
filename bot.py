@@ -6,7 +6,7 @@ import pyotp
 import requests
 
 # ===== TELEGRAM =====
-TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
+TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
 CHAT_ID = "890425913"
 
 def send(msg):
@@ -23,13 +23,13 @@ obj = SmartConnect(api_key=API_KEY)
 totp = pyotp.TOTP(TOTP_SECRET).now()
 obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-send("🚀 PRO BACKTEST STARTED")
+send("📊 BACKTEST (LIVE LOGIC) STARTED")
 
 # ===== DATE RANGE =====
 end = datetime.now()
 start = end - timedelta(days=90)
 
-# ===== SECTORS =====
+# ===== SAME SECTORS =====
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922","INDUSINDBK":"5258"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787","LTIM":"17818"},
@@ -52,6 +52,7 @@ def get_data(token):
             "fromdate":start.strftime("%Y-%m-%d 09:15"),
             "todate":end.strftime("%Y-%m-%d 15:30")
         }
+
         res = obj.getCandleData(params)
 
         if not res or 'data' not in res or not res['data']:
@@ -67,6 +68,7 @@ def get_data(token):
 
         df = df.dropna()
         df['date'] = df['time'].dt.date
+
         return df
 
     except:
@@ -83,26 +85,9 @@ for sec, stocks in SECTORS.items():
 
 send(f"✅ Loaded {len(market_data)} stocks")
 
-# ================= INDICATORS =================
-def rsi(close):
-    diff = np.diff(close)
-    gain = np.mean([x for x in diff if x > 0] or [0])
-    loss = np.mean([-x for x in diff if x < 0] or [1])
-    rs = gain/loss if loss else 1
-    return 100 - (100/(1+rs))
-
-def adx(c):
-    closes = [x[4] for x in c]
-    return min(np.std(closes)*10, 50)
-
-def vwap(df):
-    pv = ((df['high']+df['low']+df['close'])/3 * df['volume']).sum()
-    vol = df['volume'].sum()
-    return pv/vol if vol>0 else 0
-
 # ================= BACKTEST =================
 results = []
-trade_logs = []
+logs = []
 
 dates = sorted(set(
     d for v in market_data.values()
@@ -111,124 +96,111 @@ dates = sorted(set(
 
 for day in dates:
 
-    sector_strength={}
-    pool=[]
+    sector_strength = {}
+    pool = []
 
-    for sym,data in market_data.items():
+    for sym, data in market_data.items():
 
-        df=data["df"]
-        sec=data["sector"]
+        df = data["df"]
+        sec = data["sector"]
 
-        day_df=df[df['date']==day].sort_values(by="time")
+        day_df = df[df['date']==day].sort_values(by="time")
 
-        if len(day_df)<6:
+        if len(day_df) < 4:
             continue
 
-        first6 = day_df.iloc[:6]
+        # ===== 9:30 candle =====
+        first4 = day_df.iloc[:4]
 
-        open_p = first6.iloc[0]['open']
-        prev_close = df[df['date'] < day]['close'].iloc[-1] if len(df[df['date'] < day])>0 else open_p
+        open_p = first4.iloc[0]['open']
+        ltp = first4.iloc[3]['close']
 
-        # ===== GAP FILTER =====
-        gap = ((open_p - prev_close)/prev_close)*100
-        if abs(gap) < 0.5:
-            continue
-
-        ltp = first6.iloc[3]['close']
-        change=((ltp-open_p)/open_p)*100
-
-        closes = first6['close'].values
-
-        high_920 = first6.iloc[:3]['high'].max()
-        low_920 = first6.iloc[:3]['low'].min()
-        breakout = ltp > high_920 or ltp < low_920
-
-        vol_now = first6.iloc[3]['volume']
-        avg_vol = first6.iloc[:5]['volume'].mean()
-        volume_ok = vol_now > 1.5 * avg_vol if avg_vol!=0 else False
-
-        pool.append({
-            "sym":sym,
-            "sector":sec,
-            "ltp":ltp,
-            "change":change,
-            "rsi":rsi(closes),
-            "adx":adx(first6.values.tolist()),
-            "vwap":vwap(first6),
-            "breakout":breakout,
-            "volume":volume_ok
-        })
+        change = ((ltp - open_p)/open_p)*100
 
         sector_strength.setdefault(sec, []).append(change)
 
-    sector_strength = {k:sum(v)/len(v) for k,v in sector_strength.items() if v}
+        if abs(change) < 1:
+            continue
 
-    signals=[]
+        pool.append({
+            "sym": sym,
+            "sector": sec,
+            "ltp": ltp,
+            "change": change
+        })
 
-    for s in pool:
+    # ===== SECTOR STRENGTH =====
+    sector_strength = {
+        k: sum(v)/len(v)
+        for k,v in sector_strength.items() if v
+    }
 
-        sec_str = sector_strength.get(s["sector"],0)
-        direction = "BUY" if s["change"]>0 else "SELL"
-
-        score=0
-
-        if abs(sec_str)>0.7: score+=1
-        if abs(s["change"])>1: score+=1
-        if s["breakout"]: score+=1
-        if s["volume"]: score+=1
-
-        if direction=="BUY" and s["ltp"]>s["vwap"]: score+=1
-        if direction=="SELL" and s["ltp"]<s["vwap"]: score+=1
-
-        if direction=="BUY" and s["rsi"]>60 and s["adx"]>25: score+=1
-        if direction=="SELL" and s["rsi"]<40 and s["adx"]>25: score+=1
-
-        if score>=5:
-            signals.append((s,direction))
-
-    if not signals:
+    if not pool:
         continue
 
-    s,direction = sorted(signals, key=lambda x:abs(x[0]["change"]), reverse=True)[0]
+    # ===== PICK TOP 2 =====
+    pool = sorted(pool, key=lambda x: abs(x['change']), reverse=True)
+    top2 = pool[:2]
 
-    entry = s["ltp"]
+    final = top2[0]
 
-    full_day = df[df['date']==day].sort_values(by="time")
+    direction = "BUY" if final['change'] > 0 else "SELL"
+    entry = final['ltp']
 
-    tp = entry * 1.015
-    sl = entry * 0.99
+    # ===== SL / TP =====
+    sl = entry * 0.99 if direction == "BUY" else entry * 1.01
+    tp = entry * 1.02 if direction == "BUY" else entry * 0.98
+
+    full_day = df[df['date']==day]
 
     pnl = 0
+    result = "NONE"
+
     for _, row in full_day.iterrows():
 
-        if row['time'].hour >= 10 and row['time'].minute >= 30:
-            break  # TIME EXIT
+        high = row['high']
+        low = row['low']
 
-        if direction=="BUY":
-            if row['high'] >= tp:
-                pnl = 1.5
+        if direction == "BUY":
+            if high >= tp:
+                pnl = 2
+                result = "TP"
                 break
-            elif row['low'] <= sl:
+            elif low <= sl:
                 pnl = -1
+                result = "SL"
                 break
 
         else:
-            if row['low'] <= entry*0.985:
-                pnl = 1.5
+            if low <= tp:
+                pnl = 2
+                result = "TP"
                 break
-            elif row['high'] >= entry*1.01:
+            elif high >= sl:
                 pnl = -1
+                result = "SL"
                 break
 
     results.append(pnl)
-    trade_logs.append(f"{day} | {direction} {s['sym']} | {pnl}%")
+
+    logs.append(f"{day} | {direction} {final['sym']} | {result} | {pnl}%")
 
 # ================= RESULT =================
 total = len(results)
 wins = len([x for x in results if x > 0])
-winrate = (wins/total)*100 if total else 0
+winrate = (wins / total)*100 if total else 0
 avg = np.mean(results) if results else 0
 
-send(f"📊 RESULT\nTrades: {total}\nWin Rate: {round(winrate,2)}%\nAvg: {round(avg,2)}%")
+summary = f"""
+📊 BACKTEST RESULT (LIVE LOGIC)
 
-send("🔥 SAMPLE TRADES:\n" + "\n".join(trade_logs[:10]))
+Total Trades: {total}
+Win Rate: {round(winrate,2)}%
+Avg Return: {round(avg,2)}%
+"""
+
+print(summary)
+send(summary)
+
+# ===== SAMPLE TRADES =====
+send("🔥 SAMPLE TRADES:\n" + "\n".join(logs[:15]))
