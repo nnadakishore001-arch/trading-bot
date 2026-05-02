@@ -1,48 +1,27 @@
 import pandas as pd
 import numpy as np
+import requests
+import pyotp
+import time
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
-import pyotp
-import requests
-import time
 
-# ========= TELEGRAM =========
-TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
-CHAT_ID = "890425913"
-
-def send(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-    except:
-        pass
-
-# ========= LOGIN =========
-API_KEY = "VYFnGUA8"
-CLIENT_ID = "M373866"
-PASSWORD = "0917"
+# ==============================================================================
+# ── CONFIG
+# ==============================================================================
+TOKEN_TG    = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
+CHAT_ID     = "890425913"
+API_KEY     = "VYFnGUA8"
+CLIENT_ID   = "M373866"
+PASSWORD    = "0917"
 TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
-
-def login():
-    for _ in range(5):
-        try:
-            obj = SmartConnect(api_key=API_KEY)
-            totp = pyotp.TOTP(TOTP_SECRET).now()
-            data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-
-            if data.get("status"):
-                obj.setAccessToken(data['data']['jwtToken'])
-                return obj
-        except:
-            time.sleep(2)
-    raise Exception("Login Failed")
 
 # Backtest window — Angel One stores max ~60 days of 5-min data
 # Use 45 days to stay safely within the window
 BT_DAYS         = 45
 BT_END          = datetime.now()
 BT_START        = BT_END - timedelta(days=BT_DAYS)
- 
+
 # Strategy thresholds (must match live bot exactly)
 MIN_SCORE       = 6
 MIN_SECTOR_STR  = 0.7
@@ -56,7 +35,7 @@ TP2_MULT        = 3.0
 MAX_PICKS_DAY   = 2     # max trades per day (same as live)
 ENTRY_TIME      = "09:30"
 EXIT_TIME       = "15:15"
- 
+
 # ==============================================================================
 # ── SECTORS
 # ==============================================================================
@@ -74,9 +53,9 @@ SECTORS = {
     "NBFC":   {"BAJFINANCE":"317","BAJAJFINSV":"16675","CHOLAFIN":"685"},
     "INFRA":  {"LT":"11483","ADANIPORTS":"15083","ADANIENT":"25"},
 }
- 
+
 NIFTY_TOKEN = "99926000"
- 
+
 # ==============================================================================
 # ── TELEGRAM
 # ==============================================================================
@@ -92,12 +71,12 @@ def send(msg: str) -> None:
         except:
             pass
         time.sleep(2)
- 
+
 # ==============================================================================
 # ── LOGIN + SAFE API CALL
 # ==============================================================================
 _obj = None
- 
+
 def login():
     global _obj
     obj  = SmartConnect(api_key=API_KEY)
@@ -109,7 +88,7 @@ def login():
     _obj = obj
     print(f"[LOGIN] OK — {datetime.now().strftime('%H:%M:%S')}")
     return obj
- 
+
 def safe_call(func, *args, **kwargs):
     global _obj
     for attempt in range(3):
@@ -124,7 +103,7 @@ def safe_call(func, *args, **kwargs):
             print(f"[API attempt {attempt+1}] {e}")
             time.sleep(1)
     return None
- 
+
 # ==============================================================================
 # ── DATA FETCH — chunks of 5 days (Angel One rate limit safe)
 # ==============================================================================
@@ -136,7 +115,7 @@ def fetch_history(token: str, start: datetime, end: datetime) -> pd.DataFrame:
     """
     all_rows  = []
     current   = start
- 
+
     while current < end:
         chunk_end = min(current + timedelta(days=5), end)
         params    = {
@@ -151,10 +130,10 @@ def fetch_history(token: str, start: datetime, end: datetime) -> pd.DataFrame:
             all_rows.extend(res["data"])
         current = chunk_end + timedelta(days=1)
         time.sleep(0.25)   # rate limit
- 
+
     if not all_rows:
         return pd.DataFrame()
- 
+
     df = pd.DataFrame(all_rows,
                       columns=["time","open","high","low","close","volume"])
     df["time"]   = pd.to_datetime(df["time"])
@@ -164,11 +143,11 @@ def fetch_history(token: str, start: datetime, end: datetime) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna().sort_values("time").reset_index(drop=True)
     return df
- 
+
 # ==============================================================================
 # ── INDICATORS (same functions as live bot — must be identical)
 # ==============================================================================
- 
+
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
     delta = np.diff(np.array(closes, dtype=float))
@@ -179,12 +158,12 @@ def calc_rsi(closes, period=14):
         ag = (ag*(period-1)+gains[i])/period
         al = (al*(period-1)+losses[i])/period
     return round(100 - 100/(1+ag/al), 2) if al else 100.0
- 
+
 def calc_ema_arr(prices, period):
     k, e = 2/(period+1), [prices[0]]
     for p in prices[1:]: e.append(p*k + e[-1]*(1-k))
     return np.array(e)
- 
+
 def calc_macd(closes):
     if len(closes) < 27:
         return {"hist": 0, "hist_prev": 0, "bull_cross": False,
@@ -203,7 +182,7 @@ def calc_macd(closes):
         "hist_rising": hist[-1] > hist[-2],
         "hist_falling":hist[-1] < hist[-2],
     }
- 
+
 def calc_obv(closes, volumes):
     c, v = np.array(closes, dtype=float), np.array(volumes, dtype=float)
     obv  = [0.0]
@@ -216,19 +195,19 @@ def calc_obv(closes, volumes):
     k  = 2/(p+1); oe = [oa[0]]
     for x in oa[1:]: oe.append(x*k+oe[-1]*(1-k))
     return {"bull": oa[-1] > oe[-1], "bear": oa[-1] < oe[-1]}
- 
+
 def calc_rvol(volumes):
     v = np.array(volumes, dtype=float)
     if len(v) < 3: return 1.0
     avg = np.mean(v[-6:-1]) if len(v) >= 6 else np.mean(v[:-1])
     return round(v[-1]/avg, 2) if avg > 0 else 1.0
- 
+
 def calc_vwap(df_slice):
     tp = (df_slice["high"]+df_slice["low"]+df_slice["close"])/3
     tv = (tp * df_slice["volume"]).sum()
     vt = df_slice["volume"].sum()
     return round(tv/vt, 2) if vt > 0 else 0.0
- 
+
 def calc_atr(df_slice, period=14):
     if len(df_slice) < 2: return 0.0
     tr = []
@@ -238,7 +217,7 @@ def calc_atr(df_slice, period=14):
         pc = df_slice.iloc[i-1]["close"]
         tr.append(max(h-l, abs(h-pc), abs(l-pc)))
     return round(np.mean(tr[-period:]), 2) if tr else 0.0
- 
+
 def calc_adx(df_slice, period=14):
     if len(df_slice) < period+2: return 0.0
     h = df_slice["high"].values
@@ -257,17 +236,17 @@ def calc_adx(df_slice, period=14):
     dx=[100*abs(p/a-m/a)/(p/a+m/a) if a and (p/a+m/a) else 0
         for p,m,a in zip(p14,m14,a14)]
     return round(sum(dx[-period:])/period, 2) if dx else 0.0
- 
+
 def calc_ema21_val(closes):
     if len(closes) < 21: return closes[-1]
     return round(float(calc_ema_arr(np.array(closes, dtype=float), 21)[-1]), 2)
- 
+
 def get_grade(score):
     if score >= 8: return "A+"
     if score >= 6: return "A"
     if score >= 5: return "B"
     return "C"
- 
+
 # ==============================================================================
 # ── SIGNAL SCORER (identical logic to live bot)
 # ==============================================================================
@@ -278,7 +257,7 @@ def score_bar(df_up_to_bar: pd.DataFrame, direction: str,
     volumes = df_up_to_bar["volume"].values
     ltp     = float(closes[-1])
     is_bull = direction == "BUY"
- 
+
     rsi_v  = calc_rsi(closes)
     macd_v = calc_macd(closes)
     obv_v  = calc_obv(closes, volumes)
@@ -287,11 +266,11 @@ def score_bar(df_up_to_bar: pd.DataFrame, direction: str,
     atr_v  = calc_atr(df_up_to_bar)
     adx_v  = calc_adx(df_up_to_bar)
     ema21  = calc_ema21_val(closes)
- 
+
     orb_h  = df_up_to_bar.iloc[:3]["high"].max() if len(df_up_to_bar) >= 3 else ltp
     orb_l  = df_up_to_bar.iloc[:3]["low"].min()  if len(df_up_to_bar) >= 3 else ltp
     orb_b  = ltp > orb_h if is_bull else ltp < orb_l
- 
+
     L1 = macd_v["bull_cross"] or macd_v["hist_rising"]  if is_bull else \
          macd_v["bear_cross"] or macd_v["hist_falling"]
     L2 = obv_v["bull"]  if is_bull else obv_v["bear"]
@@ -303,10 +282,10 @@ def score_bar(df_up_to_bar: pd.DataFrame, direction: str,
     G2 = ltp > vwap_v if is_bull else ltp < vwap_v
     G3 = adx_v > 20
     G4 = nifty_chg > 0 if is_bull else nifty_chg < 0
- 
+
     score = sum([L1, L2, L3, L4, L5, G1, G2, G3, G4])
     grade = get_grade(score)
- 
+
     # ATR-based SL using EMA21 as floor
     risk  = atr_v * ATR_SL_MULT
     if is_bull:
@@ -319,7 +298,7 @@ def score_bar(df_up_to_bar: pd.DataFrame, direction: str,
         if sl <= ltp: sl = round(ltp + risk, 2)
         tp1 = round(ltp - risk * TP1_MULT, 2)
         tp2 = round(ltp - risk * TP2_MULT, 2)
- 
+
     return {
         "score": score, "grade": grade,
         "valid": score >= MIN_SCORE and grade in ("A+","A"),
@@ -327,7 +306,7 @@ def score_bar(df_up_to_bar: pd.DataFrame, direction: str,
         "atr": atr_v, "rsi": rsi_v, "adx": adx_v,
         "rvol": rvol_v, "vwap": vwap_v, "ema21": ema21,
     }
- 
+
 # ==============================================================================
 # ── TRADE SIMULATOR — check SL/TP on future candles
 # ==============================================================================
@@ -342,15 +321,15 @@ def simulate_trade(df_future: pd.DataFrame, direction: str,
     tp1_hit   = False
     exit_p    = entry
     result    = "TIMEOUT"    # default: closed at 3:15
- 
+
     for _, row in df_future.iterrows():
         # Time filter — no after-hours simulation
         t = row["time"].strftime("%H:%M")
         if t < "09:15" or t > "15:15":
             continue
- 
+
         h, l = row["high"], row["low"]
- 
+
         if direction == "BUY":
             if not tp1_hit and h >= tp1:
                 tp1_hit = True   # 50% booked at TP1
@@ -370,21 +349,21 @@ def simulate_trade(df_future: pd.DataFrame, direction: str,
                 exit_p = sl; result = "SL"
                 if tp1_hit: result = "TP1+SL"
                 break
- 
+
     # TIMEOUT — force close at last available price
     if result == "TIMEOUT":
         exit_p  = float(df_future.iloc[-1]["close"])
         result  = "TIMEOUT"
- 
+
     pnl_pts = round((exit_p - entry) * (1 if direction=="BUY" else -1), 2)
     pnl_pct = round(pnl_pts / entry * 100, 3) if entry else 0
- 
+
     # Blended PnL for partial exits
     if result == "TP1+SL":
         pnl_pts = round(((tp1 - entry)*0.5 + (sl - entry)*0.5) *
                         (1 if direction=="BUY" else -1), 2)
         pnl_pct = round(pnl_pts/entry*100, 3)
- 
+
     return {
         "result":    result,
         "exit_price":round(exit_p, 2),
@@ -392,7 +371,7 @@ def simulate_trade(df_future: pd.DataFrame, direction: str,
         "pnl_pct":   pnl_pct,
         "is_win":    result in ("TP1","TP2","TP1+SL"),
     }
- 
+
 # ==============================================================================
 # ── MAIN BACKTEST LOOP
 # ==============================================================================
@@ -402,17 +381,17 @@ def run_backtest():
     print(f"  Stocks  : {sum(len(v) for v in SECTORS.values())}")
     print(f"  Score gate: {MIN_SCORE}/9 | SL: ATR×{ATR_SL_MULT}")
     print(f"{'='*55}\n")
- 
+
     send(f"<b>Backtest started</b>\n"
          f"Range: {BT_START.strftime('%d %b')} → {BT_END.strftime('%d %b %Y')}\n"
          f"Stocks: {sum(len(v) for v in SECTORS.values())} | Gate: {MIN_SCORE}/9\n"
          f"Fetching data... (~15 min)")
- 
+
     # ── Step 1: Fetch all historical data
     market = {}
     total_stocks = sum(len(v) for v in SECTORS.values())
     fetched = 0
- 
+
     for sec, stocks in SECTORS.items():
         for sym, tok in stocks.items():
             fetched += 1
@@ -424,27 +403,27 @@ def run_backtest():
             else:
                 print("NO DATA")
             time.sleep(0.2)
- 
+
     # Fetch NIFTY for index bias
     print("Fetching NIFTY...")
     nifty_df = fetch_history(NIFTY_TOKEN, BT_START, BT_END)
- 
+
     send(f"✅ Loaded {len(market)}/{total_stocks} stocks\nRunning backtest...")
- 
+
     # ── Step 2: Get all trading dates
     dates = sorted(set(d for v in market.values()
                        for d in v["df"]["date"].unique()))
     print(f"\nTrading days found: {len(dates)}")
- 
+
     # ── Step 3: Day-by-day simulation
     trades     = []   # all trade records
     equity_pts = 0.0  # cumulative PnL in points
- 
+
     for day in dates:
         day_pool        = []
         sector_strength = {}
         nifty_chg       = 0.0
- 
+
         # Get NIFTY change for this day
         if not nifty_df.empty:
             nd = nifty_df[nifty_df["date"] == day]
@@ -453,7 +432,7 @@ def run_backtest():
                     (float(nd.iloc[-1]["close"]) - float(nd.iloc[0]["open"]))
                     / float(nd.iloc[0]["open"]) * 100, 2
                 ) if nd.iloc[0]["open"] > 0 else 0
- 
+
         # Compute sector strength for this day
         for sym, data in market.items():
             dd = data["df"][data["df"]["date"] == day].sort_values("time")
@@ -464,41 +443,41 @@ def run_backtest():
             chg = round((c - o) / o * 100, 3)
             sec = data["sector"]
             sector_strength.setdefault(sec, []).append(chg)
- 
+
         sector_strength = {k: round(sum(v)/len(v), 3)
                            for k, v in sector_strength.items()}
- 
+
         # Score each stock at 9:30 AM bar
         for sym, data in market.items():
             dd  = data["df"][data["df"]["date"] == day].sort_values("time")
             sec = data["sector"]
- 
+
             # Need enough bars for indicators
             if len(dd) < 8: continue
- 
+
             # Entry bar = first bar >= 09:30
             # Find the bar index where time >= 09:30
             entry_mask = dd["h_min"] >= ENTRY_TIME
             if not entry_mask.any(): continue
             entry_idx  = dd[entry_mask].index[0]
             entry_pos  = dd.index.get_loc(entry_idx)
- 
+
             # Use all candles up to and including entry bar
             df_entry = dd.iloc[:entry_pos + 1]
             if len(df_entry) < 6: continue
- 
+
             o   = float(dd.iloc[0]["open"])
             ltp = float(df_entry.iloc[-1]["close"])
             if o <= 0: continue
- 
+
             chg       = round((ltp - o) / o * 100, 3)
             direction = "BUY" if chg > 0 else "SELL"
- 
+
             if abs(chg) < MIN_STOCK_CHANGE: continue
- 
+
             sec_str = sector_strength.get(sec, 0)
             sig     = score_bar(df_entry, direction, sec_str, nifty_chg)
- 
+
             if sig["valid"]:
                 # Future candles for trade simulation
                 df_future = dd.iloc[entry_pos + 1:]
@@ -512,9 +491,9 @@ def run_backtest():
                     "df_future":df_future,
                     "change":   chg,
                 })
- 
+
         if not day_pool: continue
- 
+
         # Pick top MAX_PICKS_DAY by grade then score
         grade_rank = {"A+":0,"A":1,"B":2,"C":3}
         day_pool.sort(key=lambda x: (
@@ -522,7 +501,7 @@ def run_backtest():
             -abs(x["change"])
         ))
         picks = day_pool[:MAX_PICKS_DAY]
- 
+
         for p in picks:
             sig   = p["sig"]
             trade = simulate_trade(
@@ -530,7 +509,7 @@ def run_backtest():
                 sig["ltp"], sig["sl"], sig["tp1"], sig["tp2"]
             )
             equity_pts += trade["pnl_pts"]
- 
+
             record = {
                 "date":      p["date"],
                 "sym":       p["sym"],
@@ -557,14 +536,14 @@ def run_backtest():
             trades.append(record)
             print(f"  {p['date']} {p['direction']} {p['sym']} [{sig['grade']}] "
                   f"Score:{sig['score']}/9 → {trade['result']} {trade['pnl_pts']:+.1f}pts")
- 
+
     # ── Step 4: Compute statistics
     df_t = pd.DataFrame(trades)
- 
+
     if df_t.empty:
         send("❌ Backtest: No valid trades found in date range")
         return
- 
+
     total        = len(df_t)
     wins         = df_t["is_win"].sum()
     losses       = total - wins
@@ -582,7 +561,7 @@ def run_backtest():
         peak  = max(peak, cur)
         dd    = min(dd, cur - peak)
     max_dd = round(dd, 1)
- 
+
     # Grade breakdown
     grade_stats = {}
     for g in ["A+","A","B"]:
@@ -595,7 +574,7 @@ def run_backtest():
             "wr":    round(gw/len(gdf)*100, 1),
             "pts":   round(gdf["pnl_pts"].sum(), 1),
         }
- 
+
     # Sector breakdown
     sector_stats = {}
     for sec in df_t["sector"].unique():
@@ -606,10 +585,10 @@ def run_backtest():
             "wins":  int(sw),
             "wr":    round(sw/len(sdf)*100, 1),
         }
- 
+
     # Result distribution
     result_counts = df_t["result"].value_counts().to_dict()
- 
+
     # Sample trade log (first 20)
     log_lines = []
     for _, row in df_t.head(20).iterrows():
@@ -618,12 +597,12 @@ def run_backtest():
             f"{row['date']} | {row['direction']} {row['sym']} [{row['grade']}] "
             f"| {row['result']} | {sign}{row['pnl_pts']}pts"
         )
- 
+
     # ── Step 5: Save CSV
     csv_path = "backtest_results.csv"
     df_t.to_csv(csv_path, index=False)
     print(f"\n[SAVED] {csv_path}")
- 
+
     # ── Step 6: Print + Telegram results
     summary = f"""
 {'='*55}
@@ -647,18 +626,18 @@ GRADE BREAKDOWN
     for g, gs in grade_stats.items():
         summary += (f"  [{g}] {gs['total']} trades | {gs['wins']}W "
                     f"| {gs['wr']}% WR | {gs['pts']:+.1f}pts\n")
- 
+
     summary += f"\nRESULT TYPES\n"
     for r, cnt in result_counts.items():
         summary += f"  {r:<12} : {cnt}\n"
- 
+
     summary += f"\nSECTOR WIN RATES\n"
     for sec, ss in sorted(sector_stats.items(),
                            key=lambda x: x[1]["wr"], reverse=True):
         summary += f"  {sec:<8} : {ss['total']} trades | {ss['wr']}% WR\n"
- 
+
     print(summary)
- 
+
     # Send to Telegram in parts (message length limit)
     tg_main = (
         f"<b>📊 BACKTEST RESULTS</b>\n"
@@ -678,17 +657,17 @@ GRADE BREAKDOWN
     )
     for g, gs in grade_stats.items():
         tg_main += f"[{g}] {gs['total']}T | {gs['wr']}% WR | {gs['pts']:+.1f}pts\n"
- 
+
     tg_main += f"\n<b>Sector Win Rates</b>\n"
     for sec, ss in sorted(sector_stats.items(),
                            key=lambda x: x[1]["wr"], reverse=True):
         tg_main += f"{sec:<8}: {ss['wr']}% ({ss['total']} trades)\n"
- 
+
     send(tg_main)
     time.sleep(1)
- 
+
     send("🔥 <b>Sample Trades (first 20)</b>\n" + "\n".join(log_lines))
- 
+
     # Final verdict
     verdict = "✅ SYSTEM READY FOR LIVE" if (win_rate >= 65 and profit_factor >= 1.2) \
               else "⚠️ NEEDS TUNING BEFORE LIVE"
@@ -696,10 +675,10 @@ GRADE BREAKDOWN
          f"Win rate: {win_rate}% (need ≥65%)\n"
          f"PF: {profit_factor} (need ≥1.2)\n"
          f"Results saved: backtest_results.csv")
- 
+
     print(f"\n[DONE] {verdict}")
     return df_t
- 
+
 # ==============================================================================
 # ── RUN
 # ==============================================================================
