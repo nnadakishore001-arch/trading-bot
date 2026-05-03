@@ -1,69 +1,53 @@
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from SmartApi import SmartConnect
 import pyotp
 import requests
 import time
+import pytz
 
 # ========= TELEGRAM =========
-TOKEN = "8691427620:AAF5vkJmHqETtm2TyhEd6CLdozCPsa57ATg"
+TOKEN = "8706462182:AAHt5JMZ5tfMUjfKTYncwcfHZCflpQY9hHA"
 CHAT_ID = "890425913"
 
 def send(msg):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": msg})
     except:
         pass
 
 # ========= LOGIN =========
-API_KEY = "VYFnGUA8"
-CLIENT_ID = "M373866"
-PASSWORD = "0917"
-TOTP_SECRET = "3MLPA7DT7BA674CP73DHFDWJ2Q"
-
-session_time = None
+API_KEY      = "VYFnGUA8"
+CLIENT_ID    = "M373866"
+PASSWORD     = "0917"
+TOTP_SECRET  = "3MLPA7DT7BA674CP73DHFDWJ2Q"
 
 def login():
-    global session_time
-    for attempt in range(5):
+    for i in range(3):
         try:
-            print(f"Login attempt {attempt+1}")
-
             obj = SmartConnect(api_key=API_KEY)
             totp = pyotp.TOTP(TOTP_SECRET).now()
-
             data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
             if data and data.get("status"):
                 obj.setAccessToken(data['data']['jwtToken'])
-                session_time = datetime.now()
+                obj.setRefreshToken(data['data']['refreshToken'])
+                obj.feed_token = data['data']['feedToken']
+
                 print("✅ Login Success")
+
+                time.sleep(2)
+                try:
+                    obj.getProfile(obj.getAccessToken())
+                except:
+                    pass
+
                 return obj
-
-        except Exception as e:
-            print("Login error:", e)
-
-        time.sleep(10)
-
+        except:
+            pass
+        time.sleep(6)
     return None
-
-obj = login()
-
-if obj is None:
-    send("❌ Login failed. Try after 10 mins.")
-    exit()
-
-send("🚀 BACKTEST STARTED\n⏳ Fetching market data...")
-
-# ========= LAST 30 DAYS =========
-today = datetime.now()
-if today.year > 2025:
-    today = datetime(2025, 4, 30)
-
-end = today
-start = end - timedelta(days=30)
 
 # ========= CONFIG =========
 SECTORS = {
@@ -83,172 +67,162 @@ INDICES = {
     "BANKNIFTY": "99926009"
 }
 
-# ========= DATA FETCH =========
-def get_data(token):
-    global obj
-
+# ========= API =========
+def get_data(obj, token):
     try:
+        now = datetime.now()
+        start = now.replace(hour=9, minute=15, second=0)
+
         res = obj.getCandleData({
             "exchange": "NSE",
             "symboltoken": token,
             "interval": "FIVE_MINUTE",
-            "fromdate": start.strftime("%Y-%m-%d 09:15"),
-            "todate": end.strftime("%Y-%m-%d 15:30")
+            "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+            "todate": now.strftime("%Y-%m-%d %H:%M")
         })
 
-        # Handle token expiry ONCE only
-        if res and res.get("errorCode") == "AG8001":
-            print("Token expired → relogin once")
-            time.sleep(5)
-            obj = login()
+        if res and res.get("data"):
+            df = pd.DataFrame(res["data"],
+                              columns=["time","open","high","low","close","volume"])
+            return df
 
-            res = obj.getCandleData({
-                "exchange": "NSE",
-                "symboltoken": token,
-                "interval": "FIVE_MINUTE",
-                "fromdate": start.strftime("%Y-%m-%d 09:15"),
-                "todate": end.strftime("%Y-%m-%d 15:30")
+    except:
+        pass
+
+    return pd.DataFrame()
+
+# ========= OPTION LOGIC =========
+def get_option(price, change, direction):
+    atm = round(price / 100) * 100
+
+    if abs(change) > 1.5:
+        strike = atm - 100 if direction == "BUY" else atm + 100
+        tag = "ITM"
+    else:
+        strike = atm
+        tag = "ATM"
+
+    opt = "CE" if direction == "BUY" else "PE"
+    return strike, opt, tag
+
+# ========= STRATEGY =========
+def run_strategy(obj):
+
+    market = []
+    sector_strength = {}
+
+    # -------- INDEX --------
+    n_df = get_data(obj, INDICES["NIFTY"])
+    b_df = get_data(obj, INDICES["BANKNIFTY"])
+
+    if len(n_df) < 4 or len(b_df) < 4:
+        return
+
+    nifty_dir = 1 if n_df.iloc[3]['close'] > n_df.iloc[0]['open'] else -1
+    bank_dir = 1 if b_df.iloc[3]['close'] > b_df.iloc[0]['open'] else -1
+
+    # -------- STOCKS --------
+    for sec, stocks in SECTORS.items():
+        for sym, tok in stocks.items():
+
+            df = get_data(obj, tok)
+            if len(df) < 4:
+                continue
+
+            open_p = df.iloc[0]['open']
+            close_930 = df.iloc[3]['close']
+
+            change = ((close_930 - open_p) / open_p) * 100
+
+            sector_strength.setdefault(sec, []).append(change)
+
+            market.append({
+                "sym": sym,
+                "sector": sec,
+                "change": change,
+                "ltp": close_930
             })
 
-        if not res or not res.get("data"):
-            print(f"❌ No data for token {token}")
-            return pd.DataFrame()
+            time.sleep(1)
 
-        df = pd.DataFrame(res["data"], columns=["time","open","high","low","close","volume"])
-        df['time'] = pd.to_datetime(df['time'])
-        df['date'] = df['time'].dt.date
-
-        time.sleep(1.5)  # 🔥 Important (rate control)
-
-        return df
-
-    except Exception as e:
-        print("API failed:", e)
-        return pd.DataFrame()
-# ========= LOAD =========
-market = {}
-total_stocks = sum(len(v) for v in SECTORS.values())
-count = 0
-
-for sec, stocks in SECTORS.items():
-    for sym, tok in stocks.items():
-        count += 1
-        print(f"[{count}/{total_stocks}] Fetching {sym}")
-
-        if count % 5 == 0:
-            send(f"📡 Data Progress: {count}/{total_stocks}")
-
-        df = get_data(tok)
-
-        if not df.empty:
-            market[sym] = {"df": df, "sector": sec}
-
-send(f"✅ Data Load Complete\nStocks: {len(market)}")
-
-# ========= INDEX LOAD =========
-index_data = {}
-for name, tok in INDICES.items():
-    df = get_data(tok)
-    if not df.empty:
-        index_data[name] = df
-
-# ========= BACKTEST =========
-results = []
-dates = sorted(set(d for v in market.values() for d in v["df"]["date"]))
-
-send("⚙️ Running Backtest...")
-
-for i, day in enumerate(dates):
-
-    if i % 10 == 0:
-        send(f"📅 Progress: {i}/{len(dates)} days")
-
-    try:
-        n_df = index_data["NIFTY"]
-        n_day = n_df[n_df['date'] == day].sort_values("time")
-
-        if len(n_day) < 4:
-            continue
-
-        index_dir = 1 if n_day.iloc[3]['close'] > n_day.iloc[0]['open'] else -1
-    except:
-        continue
-
-    sector_strength = {}
-    pool = []
-
-    for sym, data in market.items():
-        df = data["df"]
-        sec = data["sector"]
-
-        day_df = df[df['date'] == day].sort_values("time")
-        if len(day_df) < 6:
-            continue
-
-        open_p = day_df.iloc[0]['open']
-        close_930 = day_df.iloc[3]['close']
-
-        change = ((close_930 - open_p) / open_p) * 100
-        sector_strength.setdefault(sec, []).append(change)
-
-        pool.append((sym, sec, change, close_930, day_df))
-
-    if not pool:
-        continue
-
+    # -------- SECTOR AVG --------
     sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
 
     signals = []
-    for sym, sec, change, ltp, df in pool:
-        sec_str = sector_strength.get(sec, 0)
+
+    for s in market:
+        sec = s["sector"]
+        change = s["change"]
 
         if abs(change) < 0.7:
             continue
-        if (change > 0 and index_dir < 0) or (change < 0 and index_dir > 0):
-            continue
-        if abs(sec_str) < 0.3:
+
+        # INDEX FILTER
+        if sec == "BANK":
+            if (change > 0 and bank_dir < 0) or (change < 0 and bank_dir > 0):
+                continue
+        else:
+            if (change > 0 and nifty_dir < 0) or (change < 0 and nifty_dir > 0):
+                continue
+
+        if abs(sector_strength.get(sec,0)) < 0.3:
             continue
 
-        signals.append((sym, change, ltp, df))
+        signals.append(s)
 
     if not signals:
-        continue
+        send("❌ No trade")
+        return
 
-    signals.sort(key=lambda x: abs(x[1]), reverse=True)
+    signals.sort(key=lambda x: abs(x["change"]), reverse=True)
 
-    sym, change, entry, df = signals[0]
+    top2 = signals[:2]
 
-    direction = "BUY" if change > 0 else "SELL"
-    sl = entry * 0.99 if direction == "BUY" else entry * 1.01
-    tp = entry * 1.02 if direction == "BUY" else entry * 0.98
+    # -------- OUTPUT --------
+    msg = "📊 Sector Heatmap\n\n"
 
-    pnl = 0
+    for sec, val in sector_strength.items():
+        bars = "🟢"*min(int(abs(val)*2),5) if val>0 else "🔴"*min(int(abs(val)*2),5)
+        msg += f"{sec} {round(val,2)}% {bars}\n"
 
-    for _, row in df.iterrows():
-        if direction == "BUY":
-            if row['high'] >= tp:
-                pnl = 2; break
-            elif row['low'] <= sl:
-                pnl = -1; break
-        else:
-            if row['low'] <= tp:
-                pnl = 2; break
-            elif row['high'] >= sl:
-                pnl = -1; break
+    msg += "\n🔥 Top Picks (F&O)\n\n"
 
-    results.append(pnl)
+    for s in top2:
+        direction = "BUY" if s["change"] > 0 else "SELL"
+        strike, opt, tag = get_option(s["ltp"], s["change"], direction)
 
-# ========= RESULT =========
-total = len(results)
-wins = len([x for x in results if x > 0])
-winrate = (wins / total) * 100 if total else 0
+        msg += (
+            f"{direction} {s['sym']}\n"
+            f"Sector: {s['sector']}\n"
+            f"LTP: {round(s['ltp'],2)}\n"
+            f"Move: {round(s['change'],2)}%\n"
+            f"Option: {strike} {opt} ({tag})\n\n"
+        )
 
-msg = f"""
-📊 BACKTEST COMPLETE
+    send(msg)
 
-Trades: {total}
-Win Rate: {round(winrate,2)}%
-"""
+# ========= MAIN =========
+def main():
+    obj = login()
+    if obj is None:
+        send("❌ Login Failed")
+        return
 
-print(msg)
-send(msg)
+    ist = pytz.timezone("Asia/Kolkata")
+
+    while True:
+        now = datetime.now(ist)
+
+        if now.hour == 9 and now.minute == 15:
+            send("📊 Market Open — Preparing Scan")
+            time.sleep(60)
+
+        if now.hour == 9 and now.minute == 30:
+            send("⚙️ Running Strategy")
+            run_strategy(obj)
+            time.sleep(60)
+
+        time.sleep(20)
+
+if __name__ == "__main__":
+    main()
