@@ -7,7 +7,7 @@ import time
 import pytz
 import os
 
-# ========= ENV (SECURE) =========
+# ========= ENV =========
 API_KEY = os.getenv("API_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 PASSWORD = os.getenv("PASSWORD")
@@ -34,7 +34,6 @@ def login():
     for _ in range(3):
         try:
             obj = SmartConnect(api_key=API_KEY)
-
             totp = pyotp.TOTP(TOTP_SECRET).now()
             data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
@@ -56,7 +55,6 @@ def login():
             pass
         time.sleep(5)
 
-    send("❌ Login Failed")
     return None
 
 # ========= CONFIG =========
@@ -77,38 +75,32 @@ INDICES = {
     "BANKNIFTY": "99926009"
 }
 
-# ========= SAFE API =========
+# ========= API =========
 def get_data(obj, token):
-    for _ in range(2):
-        try:
-            now = datetime.now()
-            start = now.replace(hour=9, minute=15, second=0)
+    try:
+        ist = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(ist)
+        start = now.replace(hour=9, minute=15, second=0)
 
-            res = obj.getCandleData({
-                "exchange": "NSE",
-                "symboltoken": token,
-                "interval": "FIVE_MINUTE",
-                "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-                "todate": now.strftime("%Y-%m-%d %H:%M")
-            })
+        res = obj.getCandleData({
+            "exchange": "NSE",
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+            "todate": now.strftime("%Y-%m-%d %H:%M")
+        })
 
-            if res and res.get("errorCode") == "AG8001":
-                obj = login()
-                continue
+        if res and res.get("data"):
+            df = pd.DataFrame(res["data"],
+                columns=["time","open","high","low","close","volume"])
+            return df
 
-            if res and res.get("data"):
-                df = pd.DataFrame(res["data"],
-                    columns=["time","open","high","low","close","volume"])
-                return df
-
-        except:
-            pass
-
-        time.sleep(2)
+    except:
+        pass
 
     return pd.DataFrame()
 
-# ========= OPTION LOGIC =========
+# ========= OPTION =========
 def get_option(price, change, direction):
     atm = round(price / 100) * 100
 
@@ -128,17 +120,16 @@ def run_strategy(obj):
     market = []
     sector_strength = {}
 
-    # INDEX
     n_df = get_data(obj, INDICES["NIFTY"])
     b_df = get_data(obj, INDICES["BANKNIFTY"])
 
     if len(n_df) < 4 or len(b_df) < 4:
+        send("⚠️ Index data not ready yet")
         return
 
     nifty_dir = 1 if n_df.iloc[3]['close'] > n_df.iloc[0]['open'] else -1
     bank_dir = 1 if b_df.iloc[3]['close'] > b_df.iloc[0]['open'] else -1
 
-    # STOCK LOOP
     for sec, stocks in SECTORS.items():
         for sym, tok in stocks.items():
 
@@ -148,7 +139,6 @@ def run_strategy(obj):
 
             open_p = df.iloc[0]['open']
             close_930 = df.iloc[3]['close']
-
             change = ((close_930 - open_p) / open_p) * 100
 
             sector_strength.setdefault(sec, []).append(change)
@@ -161,6 +151,10 @@ def run_strategy(obj):
             })
 
             time.sleep(1)
+
+    if not market:
+        send("⚠️ No market data available")
+        return
 
     sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
 
@@ -186,16 +180,19 @@ def run_strategy(obj):
         signals.append(s)
 
     if not signals:
-        send("❌ No Trade")
+        send("❌ No trade")
         return
 
     signals.sort(key=lambda x: abs(x["change"]), reverse=True)
-    top2 = signals[:2]
 
-    # MESSAGE
+    top2 = signals[:2]
+    final_stock = top2[0]
+
+    # ========= OUTPUT =========
     msg = "📊 Sector Heatmap\n\n"
+
     for sec, val in sector_strength.items():
-        bars = "🟢"*min(int(abs(val)*2),5) if val>0 else "🔴"*min(int(abs(val)*2),5)
+        bars = "🟢"*min(int(abs(val)*2),5) if val > 0 else "🔴"*min(int(abs(val)*2),5)
         msg += f"{sec} {round(val,2)}% {bars}\n"
 
     msg += "\n🔥 Top Picks (F&O)\n\n"
@@ -212,12 +209,25 @@ def run_strategy(obj):
             f"Option: {strike} {opt} ({tag})\n\n"
         )
 
+    direction = "BUY" if final_stock["change"] > 0 else "SELL"
+    strike, opt, tag = get_option(final_stock["ltp"], final_stock["change"], direction)
+
+    msg += "🎯 Final Stock Recommendation\n\n"
+    msg += (
+        f"{direction} {final_stock['sym']}\n"
+        f"Sector: {final_stock['sector']}\n"
+        f"LTP: {round(final_stock['ltp'],2)}\n"
+        f"Move: {round(final_stock['change'],2)}%\n"
+        f"Option: {strike} {opt} ({tag})\n"
+    )
+
     send(msg)
 
 # ========= MAIN =========
 def main():
     obj = login()
     if obj is None:
+        send("❌ Login Failed")
         return
 
     ist = pytz.timezone("Asia/Kolkata")
