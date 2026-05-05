@@ -47,24 +47,31 @@ STOCKS = {
     "TCS": "11536"
 }
 
+# 👉 FIX: USE ETF INSTEAD OF INDEX
+NIFTY = "26009"   # NIFTYBEES
+
 # ========= FETCH =========
 def get_data(obj, token):
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
-    start = now.replace(hour=9, minute=15, second=0)
+    try:
+        ist = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(ist)
+        start = now.replace(hour=9, minute=15, second=0)
 
-    res = obj.getCandleData({
-        "exchange": "NSE",
-        "symboltoken": token,
-        "interval": "FIVE_MINUTE",
-        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-        "todate": now.strftime("%Y-%m-%d %H:%M")
-    })
+        res = obj.getCandleData({
+            "exchange": "NSE",
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+            "todate": now.strftime("%Y-%m-%d %H:%M")
+        })
 
-    if res and res.get("data"):
-        df = pd.DataFrame(res["data"],
-            columns=["time","open","high","low","close","volume"])
-        return df
+        if res and res.get("data"):
+            df = pd.DataFrame(res["data"],
+                columns=["time","open","high","low","close","volume"])
+            return df
+
+    except Exception as e:
+        print("Data error:", e)
 
     return pd.DataFrame()
 
@@ -72,8 +79,11 @@ def get_data(obj, token):
 def run_backtest(obj):
 
     nifty_df = get_data(obj, NIFTY)
+
+    print("NIFTY rows:", len(nifty_df))   # DEBUG
+
     if len(nifty_df) < 4:
-        send("❌ Not enough index data")
+        send("❌ Not enough index data (ETF)")
         return
 
     nifty_dir = 1 if nifty_df.iloc[3]['close'] > nifty_df.iloc[0]['open'] else -1
@@ -82,6 +92,8 @@ def run_backtest(obj):
 
     for sym, token in STOCKS.items():
         df = get_data(obj, token)
+
+        print(f"{sym} rows:", len(df))   # DEBUG
 
         if len(df) < 10:
             continue
