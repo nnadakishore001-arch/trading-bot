@@ -5,6 +5,7 @@ import requests
 from datetime import datetime
 from SmartApi import SmartConnect
 import pytz
+import time
 
 # ========= ENV =========
 API_KEY = os.getenv("API_KEY")
@@ -15,6 +16,7 @@ TOTP_SECRET = os.getenv("TOTP_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# ========= TELEGRAM =========
 def send(msg):
     try:
         requests.post(
@@ -40,7 +42,7 @@ def login():
     send("❌ Login Failed")
     return None
 
-# ========= STOCKS =========
+# ========= STOCK LIST =========
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
@@ -82,31 +84,39 @@ def get_data(obj, token):
 def run_backtest(obj):
 
     best = None
+    total_checked = 0
 
-    for sym, token in STOCKS.items():
-        df = get_data(obj, token)
+    for sector, stocks in SECTORS.items():
+        for sym, token in stocks.items():
 
-        print(f"{sym} rows:", len(df))  # DEBUG
+            df = get_data(obj, token)
 
-        if len(df) < 10:
-            continue
+            print(f"{sym} rows:", len(df))
 
-        open_p = df.iloc[0]['open']
-        entry = df.iloc[3]['close']
+            if len(df) < 10:
+                continue
 
-        change = ((entry - open_p) / open_p) * 100
+            total_checked += 1
 
-        # 👉 Momentum filter
-        if abs(change) < 0.7:
-            continue
+            open_p = df.iloc[0]['open']
+            entry = df.iloc[3]['close']
 
-        if not best or abs(change) > abs(best["change"]):
-            best = {
-                "sym": sym,
-                "entry": entry,
-                "df": df,
-                "change": change
-            }
+            change = ((entry - open_p) / open_p) * 100
+
+            # Momentum filter
+            if abs(change) < 0.7:
+                continue
+
+            if not best or abs(change) > abs(best["change"]):
+                best = {
+                    "sym": sym,
+                    "entry": entry,
+                    "df": df,
+                    "change": change,
+                    "sector": sector
+                }
+
+            time.sleep(0.7)  # avoid API overload
 
     if not best:
         send("❌ No trade setup today")
@@ -144,8 +154,10 @@ def run_backtest(obj):
 
     # ========= OUTPUT =========
     msg = (
-        f"📊 TODAY BACKTEST RESULT (NO INDEX)\n\n"
+        f"📊 TODAY BACKTEST RESULT\n\n"
+        f"Stocks Scanned: {total_checked}\n\n"
         f"Stock: {best['sym']}\n"
+        f"Sector: {best['sector']}\n"
         f"Direction: {direction}\n"
         f"Entry: {round(entry,2)}\n"
         f"Move: {round(best['change'],2)}%\n\n"
