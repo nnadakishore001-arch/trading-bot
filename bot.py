@@ -36,13 +36,13 @@ def login():
         obj.setAccessToken(data['data']['jwtToken'])
         obj.setRefreshToken(data['data']['refreshToken'])
         obj.feed_token = data['data']['feedToken']
-        send("✅ Backtest Login Success")
+        send("✅ Login Success")
         return obj
 
     send("❌ Login Failed")
     return None
 
-# ========= STOCK LIST =========
+# ========= STOCKS =========
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
@@ -71,123 +71,129 @@ def get_data(obj, token):
         })
 
         if res and res.get("data"):
-            df = pd.DataFrame(res["data"],
+            return pd.DataFrame(res["data"],
                 columns=["time","open","high","low","close","volume"])
-            return df
 
-    except Exception as e:
-        print("Data error:", e)
+    except:
+        pass
 
     return pd.DataFrame()
 
-# ========= BACKTEST =========
-def run_backtest(obj):
+# ========= INDEX (LTP BASED) =========
+def get_index_direction(obj):
+    try:
+        nifty = obj.ltpData("NSE", "NIFTY", "99926000")['data']['ltp']
+        bank = obj.ltpData("NSE", "BANKNIFTY", "99926009")['data']['ltp']
 
-    best = None
-    fallback = None
-    total_checked = 0
+        return nifty, bank
+    except:
+        return None, None
 
-    for sector, stocks in SECTORS.items():
-        for sym, token in stocks.items():
+# ========= STRATEGY =========
+def scan_market(obj):
 
-            df = get_data(obj, token)
+    market = []
+    sector_strength = {}
 
+    for sec, stocks in SECTORS.items():
+        for sym, tok in stocks.items():
+
+            df = get_data(obj, tok)
             if len(df) < 4:
                 continue
 
-            total_checked += 1
-
             open_p = df.iloc[0]['open']
-            entry = df.iloc[3]['close']
-            change = ((entry - open_p) / open_p) * 100
+            close_930 = df.iloc[3]['close']
+            change = ((close_930 - open_p) / open_p) * 100
 
-            print(sym, "change:", round(change, 2))  # DEBUG
+            sector_strength.setdefault(sec, []).append(change)
 
-            # -------- fallback (always track best) --------
-            if not fallback or abs(change) > abs(fallback["change"]):
-                fallback = {
-                    "sym": sym,
-                    "entry": entry,
-                    "df": df,
-                    "change": change,
-                    "sector": sector
-                }
+            market.append({
+                "sym": sym,
+                "sector": sec,
+                "change": change,
+                "ltp": close_930
+            })
 
-            # -------- MAIN FILTER (RELAXED) --------
-            if abs(change) < 0.4:
-                continue
+            time.sleep(0.5)
 
-            if not best or abs(change) > abs(best["change"]):
-                best = {
-                    "sym": sym,
-                    "entry": entry,
-                    "df": df,
-                    "change": change,
-                    "sector": sector
-                }
+    if not market:
+        return None, "No data"
 
-            time.sleep(0.7)
+    # sector avg
+    sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
 
-    # -------- FALLBACK --------
-    if not best:
-        send("⚠️ No strong trade → picking best available")
-        best = fallback
+    # filter
+    signals = []
+    for s in market:
+        if abs(s["change"]) >= 0.4 and abs(sector_strength[s["sector"]]) >= 0.3:
+            signals.append(s)
 
-    if not best:
-        send("❌ No data available")
-        return
+    if not signals:
+        return None, "Low momentum"
 
-    # ========= TRADE SIM =========
-    entry = best["entry"]
-    df = best["df"]
+    signals.sort(key=lambda x: abs(x["change"]), reverse=True)
 
-    direction = "BUY" if best["change"] > 0 else "SELL"
+    return signals[0], None
 
-    sl = entry * 0.99 if direction == "BUY" else entry * 1.01
-    tp = entry * 1.02 if direction == "BUY" else entry * 0.98
-
-    result = "HOLD"
-
-    for i in range(4, len(df)):
-        high = df.iloc[i]['high']
-        low = df.iloc[i]['low']
-
-        if direction == "BUY":
-            if high >= tp:
-                result = "TARGET HIT"
-                break
-            elif low <= sl:
-                result = "SL HIT"
-                break
-        else:
-            if low <= tp:
-                result = "TARGET HIT"
-                break
-            elif high >= sl:
-                result = "SL HIT"
-                break
-
-    # ========= OUTPUT =========
-    msg = (
-        f"📊 TODAY BACKTEST RESULT\n\n"
-        f"Stocks Scanned: {total_checked}\n\n"
-        f"Stock: {best['sym']}\n"
-        f"Sector: {best['sector']}\n"
-        f"Direction: {direction}\n"
-        f"Entry: {round(entry,2)}\n"
-        f"Move: {round(best['change'],2)}%\n\n"
-        f"SL: {round(sl,2)}\n"
-        f"TP: {round(tp,2)}\n\n"
-        f"Result: {result}"
-    )
-
-    send(msg)
+# ========= OPTION =========
+def option_pick(price, direction):
+    atm = round(price / 100) * 100
+    return f"{atm} {'CE' if direction=='BUY' else 'PE'}"
 
 # ========= MAIN =========
 def main():
+
     obj = login()
-    if obj:
-        run_backtest(obj)
+    if obj is None:
+        return
+
+    ist = pytz.timezone("Asia/Kolkata")
+
+    send("🚀 Bot Running (Live Mode)")
+
+    traded = False
+    no_trade_reason = None
+
+    while True:
+        now = datetime.now(ist)
+
+        # 9:20 update
+        if now.hour == 9 and now.minute == 20:
+            send("📊 Market Open — Scanning Starts")
+
+        # trading window
+        if 9 <= now.hour < 15:
+
+            if not traded:
+                signal, reason = scan_market(obj)
+
+                if signal:
+                    direction = "BUY" if signal["change"] > 0 else "SELL"
+                    opt = option_pick(signal["ltp"], direction)
+
+                    msg = (
+                        f"🔥 TRADE ALERT\n\n"
+                        f"{direction} {signal['sym']}\n"
+                        f"Sector: {signal['sector']}\n"
+                        f"LTP: {round(signal['ltp'],2)}\n"
+                        f"Move: {round(signal['change'],2)}%\n"
+                        f"Option: {opt}"
+                    )
+
+                    send(msg)
+                    traded = True
+                else:
+                    no_trade_reason = reason
+
+        # after market close
+        if now.hour >= 15 and now.minute >= 30:
+            if not traded:
+                send(f"📉 No Trade Today\nReason: {no_trade_reason}")
+            send("📊 Market Closed")
+            break
+
+        time.sleep(120)
 
 if __name__ == "__main__":
     main()
