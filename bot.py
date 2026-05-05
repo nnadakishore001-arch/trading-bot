@@ -47,8 +47,6 @@ STOCKS = {
     "TCS": "11536"
 }
 
-NIFTY = "99926000"
-
 # ========= FETCH =========
 def get_data(obj, token):
     ist = pytz.timezone("Asia/Kolkata")
