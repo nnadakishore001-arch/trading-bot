@@ -84,6 +84,7 @@ def get_data(obj, token):
 def run_backtest(obj):
 
     best = None
+    fallback = None
     total_checked = 0
 
     for sector, stocks in SECTORS.items():
@@ -91,20 +92,29 @@ def run_backtest(obj):
 
             df = get_data(obj, token)
 
-            print(f"{sym} rows:", len(df))
-
-            if len(df) < 10:
+            if len(df) < 4:
                 continue
 
             total_checked += 1
 
             open_p = df.iloc[0]['open']
             entry = df.iloc[3]['close']
-
             change = ((entry - open_p) / open_p) * 100
 
-            # Momentum filter
-            if abs(change) < 0.7:
+            print(sym, "change:", round(change, 2))  # DEBUG
+
+            # -------- fallback (always track best) --------
+            if not fallback or abs(change) > abs(fallback["change"]):
+                fallback = {
+                    "sym": sym,
+                    "entry": entry,
+                    "df": df,
+                    "change": change,
+                    "sector": sector
+                }
+
+            # -------- MAIN FILTER (RELAXED) --------
+            if abs(change) < 0.4:
                 continue
 
             if not best or abs(change) > abs(best["change"]):
@@ -116,10 +126,15 @@ def run_backtest(obj):
                     "sector": sector
                 }
 
-            time.sleep(0.7)  # avoid API overload
+            time.sleep(0.7)
+
+    # -------- FALLBACK --------
+    if not best:
+        send("⚠️ No strong trade → picking best available")
+        best = fallback
 
     if not best:
-        send("❌ No trade setup today")
+        send("❌ No data available")
         return
 
     # ========= TRADE SIM =========
