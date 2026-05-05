@@ -5,7 +5,6 @@ import requests
 from datetime import datetime
 from SmartApi import SmartConnect
 import pytz
-import time
 
 # ========= ENV =========
 API_KEY = os.getenv("API_KEY")
@@ -41,14 +40,11 @@ def login():
     send("❌ Login Failed")
     return None
 
-# ========= TOKENS =========
+# ========= STOCKS =========
 STOCKS = {
     "RELIANCE": "2885",
     "TCS": "11536"
 }
-
-# 👉 FIX: USE ETF INSTEAD OF INDEX
-NIFTY = "26009"   # NIFTYBEES
 
 # ========= FETCH =========
 def get_data(obj, token):
@@ -78,34 +74,23 @@ def get_data(obj, token):
 # ========= BACKTEST =========
 def run_backtest(obj):
 
-    nifty_df = get_data(obj, NIFTY)
-
-    print("NIFTY rows:", len(nifty_df))   # DEBUG
-
-    if len(nifty_df) < 4:
-        send("❌ Not enough index data (ETF)")
-        return
-
-    nifty_dir = 1 if nifty_df.iloc[3]['close'] > nifty_df.iloc[0]['open'] else -1
-
     best = None
 
     for sym, token in STOCKS.items():
         df = get_data(obj, token)
 
-        print(f"{sym} rows:", len(df))   # DEBUG
+        print(f"{sym} rows:", len(df))  # DEBUG
 
         if len(df) < 10:
             continue
 
         open_p = df.iloc[0]['open']
         entry = df.iloc[3]['close']
+
         change = ((entry - open_p) / open_p) * 100
 
+        # 👉 Momentum filter
         if abs(change) < 0.7:
-            continue
-
-        if (change > 0 and nifty_dir < 0) or (change < 0 and nifty_dir > 0):
             continue
 
         if not best or abs(change) > abs(best["change"]):
@@ -152,7 +137,7 @@ def run_backtest(obj):
 
     # ========= OUTPUT =========
     msg = (
-        f"📊 TODAY BACKTEST RESULT\n\n"
+        f"📊 TODAY BACKTEST RESULT (NO INDEX)\n\n"
         f"Stock: {best['sym']}\n"
         f"Direction: {direction}\n"
         f"Entry: {round(entry,2)}\n"
