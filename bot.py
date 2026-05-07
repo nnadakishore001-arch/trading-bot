@@ -29,6 +29,29 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # =========================================================
+# ENV VALIDATION
+# =========================================================
+
+required_env = {
+    "ANGEL_API_KEY": API_KEY,
+    "ANGEL_CLIENT_CODE": CLIENT_CODE,
+    "ANGEL_PASSWORD": PASSWORD,
+    "ANGEL_TOTP": TOTP_SECRET,
+    "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+    "TELEGRAM_CHAT_ID": CHAT_ID
+}
+
+for key, value in required_env.items():
+
+    if not value:
+
+        raise Exception(
+            f"{key} environment variable missing in Railway"
+        )
+
+print("\nALL ENV VARIABLES LOADED SUCCESSFULLY")
+
+# =========================================================
 # SECTOR STOCKS
 # =========================================================
 
@@ -120,9 +143,11 @@ data = obj.generateSession(
 )
 
 if not data["status"]:
+
     print("LOGIN FAILED")
     print(data)
-    quit()
+
+    raise Exception("Angel One Login Failed")
 
 print("LOGIN SUCCESS")
 
@@ -165,10 +190,13 @@ def get_historical_data(symbol, token):
         historicParam = {
 
             "exchange": "NSE",
+
             "symboltoken": token,
+
             "interval": "FIVE_MINUTE",
 
             "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+
             "todate": to_date.strftime("%Y-%m-%d %H:%M")
         }
 
@@ -188,11 +216,13 @@ def get_historical_data(symbol, token):
         if candles is None:
 
             print(f"{symbol} -> EMPTY CANDLES")
+
             return None
 
         if len(candles) == 0:
 
             print(f"{symbol} -> ZERO CANDLES")
+
             return None
 
         df = pd.DataFrame(
@@ -210,7 +240,12 @@ def get_historical_data(symbol, token):
         if df.empty:
 
             print(f"{symbol} -> EMPTY DATAFRAME")
+
             return None
+
+        # =================================================
+        # NUMERIC CONVERSION
+        # =================================================
 
         numeric_cols = [
             "open",
@@ -232,9 +267,12 @@ def get_historical_data(symbol, token):
         if len(df) < 20:
 
             print(f"{symbol} -> NOT ENOUGH DATA")
+
             return None
 
+        # =================================================
         # EMA
+        # =================================================
 
         df["EMA20"] = df["close"].ewm(
             span=20,
@@ -246,7 +284,9 @@ def get_historical_data(symbol, token):
             adjust=False
         ).mean()
 
+        # =================================================
         # RSI
+        # =================================================
 
         delta = df["close"].diff()
 
@@ -262,7 +302,9 @@ def get_historical_data(symbol, token):
 
         df["RSI"] = 100 - (100 / (1 + rs))
 
+        # =================================================
         # VWAP
+        # =================================================
 
         typical_price = (
             df["high"] +
@@ -276,7 +318,9 @@ def get_historical_data(symbol, token):
             df["volume"].cumsum()
         )
 
+        # =================================================
         # VOLUME RATIO
+        # =================================================
 
         avg_volume = df["volume"].rolling(20).mean()
 
@@ -289,6 +333,7 @@ def get_historical_data(symbol, token):
         if df.empty:
 
             print(f"{symbol} -> INDICATOR NaN")
+
             return None
 
         return df
@@ -296,6 +341,7 @@ def get_historical_data(symbol, token):
     except Exception as e:
 
         print(f"\n{symbol} DATA ERROR")
+
         traceback.print_exc()
 
         return None
@@ -319,6 +365,7 @@ def get_market_trend():
             if df is None:
 
                 print(f"{index_name} FAILED")
+
                 continue
 
             latest = df.iloc[-1]
@@ -353,6 +400,7 @@ EMA20: {ema20}
 # =========================================================
 
 signals = []
+
 rejections = []
 
 market_trend = get_market_trend()
@@ -564,7 +612,7 @@ print(summary)
 send_telegram(summary)
 
 # =========================================================
-# REJECTIONS
+# REJECTION LOGS
 # =========================================================
 
 for reject in rejections:
