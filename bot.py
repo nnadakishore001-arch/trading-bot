@@ -23,11 +23,16 @@ CHAT_ID = os.getenv("CHAT_ID")
 # TELEGRAM FUNCTION
 # =====================================================
 def send(msg):
+
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg}
+            data={
+                "chat_id": CHAT_ID,
+                "text": msg
+            }
         )
+
     except Exception as e:
         print("Telegram Error:", e)
 
@@ -35,6 +40,7 @@ def send(msg):
 # LOGIN FUNCTION
 # =====================================================
 def login():
+
     try:
         obj = SmartConnect(api_key=API_KEY)
 
@@ -47,24 +53,30 @@ def login():
         )
 
         if data and data.get("status"):
+
             obj.setAccessToken(data['data']['jwtToken'])
             obj.setRefreshToken(data['data']['refreshToken'])
             obj.feed_token = data['data']['feedToken']
 
             send("✅ Angel One Login Success")
+
             return obj
 
         send("❌ Login Failed")
+
         return None
 
     except Exception as e:
+
         send(f"❌ Login Error: {e}")
+
         return None
 
 # =====================================================
 # SECTOR STOCKS
 # =====================================================
 SECTORS = {
+
     "BANK": {
         "HDFCBANK": "1333",
         "ICICIBANK": "4963",
@@ -129,8 +141,11 @@ SECTORS = {
 # FETCH MARKET DATA
 # =====================================================
 def get_data(obj, token):
+
     try:
+
         ist = pytz.timezone("Asia/Kolkata")
+
         now = datetime.now(ist)
 
         start = now.replace(
@@ -149,6 +164,7 @@ def get_data(obj, token):
         })
 
         if response and response.get("data"):
+
             return pd.DataFrame(
                 response["data"],
                 columns=[
@@ -162,6 +178,7 @@ def get_data(obj, token):
             )
 
     except Exception as e:
+
         print("Data Error:", e)
 
     return pd.DataFrame()
@@ -172,6 +189,7 @@ def get_data(obj, token):
 def scan_market(obj):
 
     market_data = []
+
     sector_strength = {}
 
     for sector, stocks in SECTORS.items():
@@ -184,19 +202,23 @@ def scan_market(obj):
                 continue
 
             open_price = df.iloc[0]['open']
-            close_price = df.iloc[3]['close']
+
+            latest_close = df.iloc[-1]['close']
 
             change_percent = (
-                (close_price - open_price) / open_price
+                (latest_close - open_price) / open_price
             ) * 100
 
-            sector_strength.setdefault(sector, []).append(change_percent)
+            sector_strength.setdefault(
+                sector,
+                []
+            ).append(change_percent)
 
             market_data.append({
                 "symbol": symbol,
                 "sector": sector,
                 "change": change_percent,
-                "ltp": close_price
+                "ltp": latest_close
             })
 
             time.sleep(0.5)
@@ -205,7 +227,7 @@ def scan_market(obj):
         return None, "No market data"
 
     # =====================================================
-    # SECTOR AVERAGE CALCULATION
+    # SECTOR AVERAGE
     # =====================================================
     sector_strength = {
         k: sum(v) / len(v)
@@ -220,9 +242,10 @@ def scan_market(obj):
     for stock in market_data:
 
         if (
-            abs(stock["change"]) >= 0.4 and
-            abs(sector_strength[stock["sector"]]) >= 0.3
+            abs(stock["change"]) >= 0.25 and
+            abs(sector_strength[stock["sector"]]) >= 0.20
         ):
+
             signals.append(stock)
 
     if not signals:
@@ -265,6 +288,7 @@ def main():
     send("🚀 Live Trading Bot Started")
 
     traded = False
+
     no_trade_reason = None
 
     while True:
@@ -275,11 +299,11 @@ def main():
         # MARKET OPEN MESSAGE
         # =====================================================
         if now.hour == 9 and now.minute == 20:
+
             send("📊 Market Open — Live Scanning Started")
 
         # =====================================================
         # LIVE MARKET HOURS
-        # 9:15 AM to 3:30 PM
         # =====================================================
         if 9 <= now.hour < 15:
 
@@ -315,20 +339,23 @@ def main():
                     traded = True
 
                 else:
+
                     no_trade_reason = reason
 
         # =====================================================
         # MARKET CLOSE
         # =====================================================
-        if now.hour >= 15 and now.minute >= 30:
+        if (now.hour == 15 and now.minute >= 30) or now.hour > 15:
 
             if not traded:
+
                 send(
                     f"📉 No Trade Today\n"
                     f"Reason: {no_trade_reason}"
                 )
 
             send("📊 Market Closed — Bot Stopped")
+
             break
 
         # =====================================================
@@ -340,4 +367,5 @@ def main():
 # START BOT
 # =====================================================
 if __name__ == "__main__":
+
     main()
