@@ -33,12 +33,12 @@ CHAT_ID = os.getenv("CHAT_ID")
 # =========================================================
 
 required_env = {
-    "ANGEL_API_KEY": API_KEY,
-    "ANGEL_CLIENT_CODE": CLIENT_CODE,
-    "ANGEL_PASSWORD": PASSWORD,
-    "ANGEL_TOTP": TOTP_SECRET,
-    "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
-    "TELEGRAM_CHAT_ID": CHAT_ID
+    "API_KEY": API_KEY,
+    "CLIENT_CODE": CLIENT_CODE,
+    "PASSWORD": PASSWORD,
+    "TOTP_SECRET": TOTP_SECRET,
+    "TG_TOKEN": BOT_TOKEN,
+    "CHAT_ID": CHAT_ID
 }
 
 for key, value in required_env.items():
