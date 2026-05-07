@@ -1,7 +1,6 @@
 
 # Final Live Trading Bot (Angel One + Telegram)
 
-python
 import os
 import pandas as pd
 import pyotp
