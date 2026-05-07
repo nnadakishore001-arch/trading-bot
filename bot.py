@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 # =========================================================
 
 API_KEY = os.getenv("API_KEY")
-CLIENT_CODE = os.getenv("CLIENT_CODE")
+CLIENT_ID = os.getenv("CLIENT_ID")
 PASSWORD = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
 
@@ -34,7 +34,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 required_env = {
     "API_KEY": API_KEY,
-    "CLIENT_CODE": CLIENT_CODE,
+    "CLIENT_ID": CLIENT_ID,
     "PASSWORD": PASSWORD,
     "TOTP_SECRET": TOTP_SECRET,
     "TG_TOKEN": BOT_TOKEN,
