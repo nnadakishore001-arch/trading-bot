@@ -1,6 +1,4 @@
 
-# Final Live Trading Bot (Angel One + Telegram)
-
 import os
 import pandas as pd
 import pyotp
@@ -320,19 +318,18 @@ def main():
                     no_trade_reason = reason
 
         # =====================================================
+        # MARKET CLOSE
         # =====================================================
-# MARKET CLOSE
-# =====================================================
-if (now.hour == 15 and now.minute >= 30) or now.hour > 15:
+        if now.hour >= 15 and now.minute >= 30:
 
-    if not traded:
-        send(
-            f"📉 No Trade Today\n"
-            f"Reason: {no_trade_reason}"
-        )
+            if not traded:
+                send(
+                    f"📉 No Trade Today\n"
+                    f"Reason: {no_trade_reason}"
+                )
 
-    send("📊 Market Closed — Bot Stopped")
-    break
+            send("📊 Market Closed — Bot Stopped")
+            break
 
         # =====================================================
         # CHECK EVERY 2 MINUTES
@@ -344,4 +341,3 @@ if (now.hour == 15 and now.minute >= 30) or now.hour > 15:
 # =====================================================
 if __name__ == "__main__":
     main()
- 
