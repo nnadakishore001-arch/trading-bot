@@ -1,49 +1,34 @@
-import os
+
+# =========================================================
+# FINAL LIVE INTRADAY SCANNER (DEBUGGED)
+# RAILWAY READY
+# ANGEL ONE + TELEGRAM
+# =========================================================
+
+from SmartApi import SmartConnect
 import pandas as pd
+import numpy as np
 import pyotp
 import requests
-from datetime import datetime
-from SmartApi import SmartConnect
-import pytz
+import traceback
+import os
 import time
+from datetime import datetime, timedelta
 
-# ========= ENV =========
-API_KEY = os.getenv("API_KEY")
-CLIENT_ID = os.getenv("CLIENT_ID")
-PASSWORD = os.getenv("PASSWORD")
-TOTP_SECRET = os.getenv("TOTP_SECRET")
+# =========================================================
+# ENV VARIABLES FROM RAILWAY
+# =========================================================
+API_KEY = os.getenv("ANGEL_API_KEY")
+CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
+PASSWORD = os.getenv("ANGEL_PASSWORD")
+TOTP_SECRET = os.getenv("ANGEL_TOTP")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
-# ========= TELEGRAM =========
-def send(msg):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg}
-        )
-    except:
-        pass
-
-# ========= LOGIN =========
-def login():
-    obj = SmartConnect(api_key=API_KEY)
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-
-    if data and data.get("status"):
-        obj.setAccessToken(data['data']['jwtToken'])
-        obj.setRefreshToken(data['data']['refreshToken'])
-        obj.feed_token = data['data']['feedToken']
-        send("✅ Login Success")
-        return obj
-
-    send("❌ Login Failed")
-    return None
-
-# ========= STOCKS =========
-SECTORS = {
+# =========================================================
+# CONFIGURATION
+# =========================================================
+    SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
     "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669"},
@@ -55,145 +40,218 @@ SECTORS = {
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"}
 }
 
-# ========= FETCH =========
-def get_data(obj, token):
-    try:
-        ist = pytz.timezone("Asia/Kolkata")
-        now = datetime.now(ist)
-        start = now.replace(hour=9, minute=15, second=0)
+INDEXES = {
+    "NIFTY": "99926000",
+    "BANKNIFTY": "99926009"
+}
 
-        res = obj.getCandleData({
+MIN_SCORE = 4
+
+# =========================================================
+# LOGIN
+# =========================================================
+print("\n==========================")
+print("ANGEL ONE LOGIN")
+print("==========================")
+
+obj = SmartConnect(api_key=API_KEY)
+data = obj.generateSession(
+    CLIENT_CODE,
+    PASSWORD,
+    pyotp.TOTP(TOTP_SECRET).now()
+)
+
+if not data or not data.get("status"):
+    print("LOGIN FAILED")
+    print(data)
+    quit()
+
+print("LOGIN SUCCESS")
+feedToken = obj.getfeedToken()
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+def send_telegram(message):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": message}
+        requests.post(url, data=payload)
+    except Exception as e:
+        print(f"TELEGRAM ERROR: {e}")
+
+# =========================================================
+# HISTORICAL DATA & INDICATORS
+# =========================================================
+def get_historical_data(symbol, token):
+    try:
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=5)
+
+        historicParam = {
             "exchange": "NSE",
             "symboltoken": token,
             "interval": "FIVE_MINUTE",
-            "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-            "todate": now.strftime("%Y-%m-%d %H:%M")
-        })
+            "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+        }
 
-        if res and res.get("data"):
-            return pd.DataFrame(res["data"],
-                columns=["time","open","high","low","close","volume"])
+        response = obj.getCandleData(historicParam)
 
-    except:
-        pass
+        # 1. FIX: Null Response Safety Check
+        if not response or not response.get("status") or "data" not in response:
+            print(f"{symbol} -> API ERROR / NO DATA")
+            return None
 
-    return pd.DataFrame()
+        candles = response.get("data")
+        if not candles or len(candles) == 0:
+            print(f"{symbol} -> ZERO CANDLES")
+            return None
 
-# ========= INDEX (LTP BASED) =========
-def get_index_direction(obj):
-    try:
-        nifty = obj.ltpData("NSE", "NIFTY", "99926000")['data']['ltp']
-        bank = obj.ltpData("NSE", "BANKNIFTY", "99926009")['data']['ltp']
+        df = pd.DataFrame(candles, columns=["datetime", "open", "high", "low", "close", "volume"])
+        
+        # 2. FIX: Convert datetime string to actual Datetime object (Crucial for VWAP)
+        df['datetime'] = pd.to_datetime(df['datetime'])
 
-        return nifty, bank
-    except:
-        return None, None
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# ========= STRATEGY =========
-def scan_market(obj):
+        df.dropna(inplace=True)
+        if len(df) < 20:
+            return None
 
-    market = []
-    sector_strength = {}
+        # EMA
+        df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    for sec, stocks in SECTORS.items():
-        for sym, tok in stocks.items():
+        # 3. FIX: Standard RSI Calculation using Wilder's Smoothing
+        delta = df["close"].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.ewm(com=13, adjust=False).mean()
+        avg_loss = loss.ewm(com=13, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        df["RSI"] = 100 - (100 / (1 + rs))
 
-            df = get_data(obj, tok)
-            if len(df) < 4:
+        # 4. FIX: Accurate Intraday VWAP (Resets Daily)
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        df['typical_vol'] = typical_price * df["volume"]
+        
+        # Group by date to reset cumsum every day
+        df['VWAP'] = df.groupby(df['datetime'].dt.date)['typical_vol'].cumsum() / df.groupby(df['datetime'].dt.date)['volume'].cumsum()
+
+        # VOL RATIO
+        avg_volume = df["volume"].rolling(20).mean()
+        df["VOL_RATIO"] = df["volume"] / avg_volume
+
+        df.dropna(inplace=True)
+        return df
+
+    except Exception as e:
+        print(f"\n{symbol} DATA ERROR")
+        traceback.print_exc()
+        return None
+
+# =========================================================
+# INDEX TREND
+# =========================================================
+def get_market_trend():
+    bullish_count = 0
+    for index_name, token in INDEXES.items():
+        try:
+            df = get_historical_data(index_name, token)
+            if df is None:
+                continue
+            latest = df.iloc[-1]
+            if latest["close"] > latest["EMA20"]:
+                bullish_count += 1
+        except Exception:
+            pass
+
+    return "BULLISH" if bullish_count >= 1 else "SIDEWAYS"
+
+# =========================================================
+# CORE SCANNER FUNCTION
+# =========================================================
+def run_scanner():
+    print(f"\n--- SCAN STARTED AT {datetime.now().strftime('%H:%M:%S')} ---")
+    signals = []
+    rejections = []
+    
+    market_trend = get_market_trend()
+    print(f"MARKET TREND: {market_trend}")
+
+    for symbol, token in STOCKS.items():
+        try:
+            df = get_historical_data(symbol, token)
+            if df is None:
+                rejections.append(f"{symbol} -> NO VALID DATA")
                 continue
 
-            open_p = df.iloc[0]['open']
-            close_930 = df.iloc[3]['close']
-            change = ((close_930 - open_p) / open_p) * 100
+            latest = df.iloc[-1]
+            close = latest["close"]
+            ema20, ema50 = latest["EMA20"], latest["EMA50"]
+            vwap, rsi, volume_ratio = latest["VWAP"], latest["RSI"], latest["VOL_RATIO"]
 
-            sector_strength.setdefault(sec, []).append(change)
+            if pd.isna(close) or pd.isna(vwap) or pd.isna(rsi):
+                rejections.append(f"{symbol} -> INDICATOR NaN")
+                continue
 
-            market.append({
-                "sym": sym,
-                "sector": sec,
-                "change": change,
-                "ltp": close_930
-            })
+            score = 0
+            reasons = []
 
-            time.sleep(0.5)
+            if close > vwap:
+                score += 1
+            else:
+                reasons.append("Below VWAP")
 
-    if not market:
-        return None, "No data"
+            if ema20 > ema50:
+                score += 1
+            else:
+                reasons.append("EMA Weak")
 
-    # sector avg
-    sector_strength = {k: sum(v)/len(v) for k,v in sector_strength.items()}
+            if rsi > 52:
+                score += 1
+            else:
+                reasons.append(f"RSI {round(rsi,2)}")
 
-    # filter
-    signals = []
-    for s in market:
-        if abs(s["change"]) >= 0.4 and abs(sector_strength[s["sector"]]) >= 0.3:
-            signals.append(s)
+            if volume_ratio > 1.2:
+                score += 1
+            else:
+                reasons.append(f"VOL {round(volume_ratio,2)}")
 
-    if not signals:
-        return None, "Low momentum"
+            if market_trend == "BULLISH":
+                score += 1
 
-    signals.sort(key=lambda x: abs(x["change"]), reverse=True)
+            if score >= MIN_SCORE:
+                target = round(close * 1.01, 2)
+                stoploss = round(close * 0.995, 2)
 
-    return signals[0], None
+                signal = f"🚀 BUY SIGNAL\nSTOCK: {symbol}\nPRICE: {round(close,2)}\nTARGET: {target}\nSTOPLOSS: {stoploss}\nRSI: {round(rsi,2)}\nSCORE: {score}/5"
+                print(signal)
+                send_telegram(signal)
+                signals.append(symbol)
+            else:
+                rejections.append(f"{symbol} -> SCORE {score} ({', '.join(reasons)})")
 
-# ========= OPTION =========
-def option_pick(price, direction):
-    atm = round(price / 100) * 100
-    return f"{atm} {'CE' if direction=='BUY' else 'PE'}"
+        except Exception as e:
+            print(f"{symbol} CRITICAL ERROR")
+            traceback.print_exc()
 
-# ========= MAIN =========
-def main():
+    print("\n--- SCAN SUMMARY ---")
+    print(f"TREND: {market_trend} | SIGNALS: {len(signals)} | REJECTIONS: {len(rejections)}")
 
-    obj = login()
-    if obj is None:
-        return
-
-    ist = pytz.timezone("Asia/Kolkata")
-
-    send("🚀 Bot Running (Live Mode)")
-
-    traded = False
-    no_trade_reason = None
-
-    while True:
-        now = datetime.now(ist)
-
-        # 9:20 update
-        if now.hour == 9 and now.minute == 20:
-            send("📊 Market Open — Scanning Starts")
-
-        # trading window
-        if 9 <= now.hour < 15:
-
-            if not traded:
-                signal, reason = scan_market(obj)
-
-                if signal:
-                    direction = "BUY" if signal["change"] > 0 else "SELL"
-                    opt = option_pick(signal["ltp"], direction)
-
-                    msg = (
-                        f"🔥 TRADE ALERT\n\n"
-                        f"{direction} {signal['sym']}\n"
-                        f"Sector: {signal['sector']}\n"
-                        f"LTP: {round(signal['ltp'],2)}\n"
-                        f"Move: {round(signal['change'],2)}%\n"
-                        f"Option: {opt}"
-                    )
-
-                    send(msg)
-                    traded = True
-                else:
-                    no_trade_reason = reason
-
-        # after market close
-        if now.hour >= 15 and now.minute >= 30:
-            if not traded:
-                send(f"📉 No Trade Today\nReason: {no_trade_reason}")
-            send("📊 Market Closed")
-            break
-
-        time.sleep(120)
-
-if __name__ == "__main__":
-    main()
+# =========================================================
+# 5. FIX: CONTINUOUS KEEP-ALIVE LOOP
+# =========================================================
+while True:
+    try:
+        run_scanner()
+    except Exception as e:
+        print("CRITICAL SCANNER LOOP ERROR")
+        traceback.print_exc()
+    
+    print(f"\nWAITING 5 MINUTES... NEXT SCAN AT {(datetime.now() + timedelta(minutes=5)).strftime('%H:%M:%S')}")
+    # Sleep for 5 minutes before scanning again
+    time.sleep(300)
