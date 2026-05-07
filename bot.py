@@ -20,13 +20,13 @@ from datetime import datetime, timedelta
 # ENV VARIABLES
 # =========================================================
 
-API_KEY = os.getenv("ANGEL_API_KEY")
-CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
-PASSWORD = os.getenv("ANGEL_PASSWORD")
-TOTP_SECRET = os.getenv("ANGEL_TOTP")
+API_KEY = os.getenv("API_KEY")
+CLIENT_CODE = os.getenv("CLIENT_CODE")
+PASSWORD = os.getenv("PASSWORD")
+TOTP_SECRET = os.getenv("TOTP_SECRET")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BOT_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # =========================================================
 # ENV VALIDATION
