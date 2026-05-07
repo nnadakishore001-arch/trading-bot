@@ -1,6 +1,6 @@
 
 # =========================================================
-# FINAL LIVE INTRADAY SCANNER (DEBUGGED)
+# FINAL LIVE INTRADAY SCANNER (SECTOR EDITION)
 # RAILWAY READY
 # ANGEL ONE + TELEGRAM
 # =========================================================
@@ -28,7 +28,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # =========================================================
 # CONFIGURATION
 # =========================================================
-    SECTORS = {
+SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
     "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669"},
@@ -98,7 +98,6 @@ def get_historical_data(symbol, token):
 
         response = obj.getCandleData(historicParam)
 
-        # 1. FIX: Null Response Safety Check
         if not response or not response.get("status") or "data" not in response:
             print(f"{symbol} -> API ERROR / NO DATA")
             return None
@@ -109,8 +108,6 @@ def get_historical_data(symbol, token):
             return None
 
         df = pd.DataFrame(candles, columns=["datetime", "open", "high", "low", "close", "volume"])
-        
-        # 2. FIX: Convert datetime string to actual Datetime object (Crucial for VWAP)
         df['datetime'] = pd.to_datetime(df['datetime'])
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
@@ -125,7 +122,7 @@ def get_historical_data(symbol, token):
         df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
         df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-        # 3. FIX: Standard RSI Calculation using Wilder's Smoothing
+        # RSI
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
@@ -134,11 +131,9 @@ def get_historical_data(symbol, token):
         rs = avg_gain / avg_loss
         df["RSI"] = 100 - (100 / (1 + rs))
 
-        # 4. FIX: Accurate Intraday VWAP (Resets Daily)
+        # VWAP
         typical_price = (df["high"] + df["low"] + df["close"]) / 3
         df['typical_vol'] = typical_price * df["volume"]
-        
-        # Group by date to reset cumsum every day
         df['VWAP'] = df.groupby(df['datetime'].dt.date)['typical_vol'].cumsum() / df.groupby(df['datetime'].dt.date)['volume'].cumsum()
 
         # VOL RATIO
@@ -182,68 +177,73 @@ def run_scanner():
     market_trend = get_market_trend()
     print(f"MARKET TREND: {market_trend}")
 
-    for symbol, token in STOCKS.items():
-        try:
-            df = get_historical_data(symbol, token)
-            if df is None:
-                rejections.append(f"{symbol} -> NO VALID DATA")
-                continue
+    # Nested loop to handle the SECTORS dictionary
+    for sector, stocks in SECTORS.items():
+        print(f"\n--- SCANNING SECTOR: {sector} ---")
+        
+        for symbol, token in stocks.items():
+            try:
+                df = get_historical_data(symbol, token)
+                if df is None:
+                    rejections.append(f"{symbol} -> NO VALID DATA")
+                    continue
 
-            latest = df.iloc[-1]
-            close = latest["close"]
-            ema20, ema50 = latest["EMA20"], latest["EMA50"]
-            vwap, rsi, volume_ratio = latest["VWAP"], latest["RSI"], latest["VOL_RATIO"]
+                latest = df.iloc[-1]
+                close = latest["close"]
+                ema20, ema50 = latest["EMA20"], latest["EMA50"]
+                vwap, rsi, volume_ratio = latest["VWAP"], latest["RSI"], latest["VOL_RATIO"]
 
-            if pd.isna(close) or pd.isna(vwap) or pd.isna(rsi):
-                rejections.append(f"{symbol} -> INDICATOR NaN")
-                continue
+                if pd.isna(close) or pd.isna(vwap) or pd.isna(rsi):
+                    rejections.append(f"{symbol} -> INDICATOR NaN")
+                    continue
 
-            score = 0
-            reasons = []
+                score = 0
+                reasons = []
 
-            if close > vwap:
-                score += 1
-            else:
-                reasons.append("Below VWAP")
+                if close > vwap:
+                    score += 1
+                else:
+                    reasons.append("Below VWAP")
 
-            if ema20 > ema50:
-                score += 1
-            else:
-                reasons.append("EMA Weak")
+                if ema20 > ema50:
+                    score += 1
+                else:
+                    reasons.append("EMA Weak")
 
-            if rsi > 52:
-                score += 1
-            else:
-                reasons.append(f"RSI {round(rsi,2)}")
+                if rsi > 52:
+                    score += 1
+                else:
+                    reasons.append(f"RSI {round(rsi,2)}")
 
-            if volume_ratio > 1.2:
-                score += 1
-            else:
-                reasons.append(f"VOL {round(volume_ratio,2)}")
+                if volume_ratio > 1.2:
+                    score += 1
+                else:
+                    reasons.append(f"VOL {round(volume_ratio,2)}")
 
-            if market_trend == "BULLISH":
-                score += 1
+                if market_trend == "BULLISH":
+                    score += 1
 
-            if score >= MIN_SCORE:
-                target = round(close * 1.01, 2)
-                stoploss = round(close * 0.995, 2)
+                if score >= MIN_SCORE:
+                    target = round(close * 1.01, 2)
+                    stoploss = round(close * 0.995, 2)
 
-                signal = f"🚀 BUY SIGNAL\nSTOCK: {symbol}\nPRICE: {round(close,2)}\nTARGET: {target}\nSTOPLOSS: {stoploss}\nRSI: {round(rsi,2)}\nSCORE: {score}/5"
-                print(signal)
-                send_telegram(signal)
-                signals.append(symbol)
-            else:
-                rejections.append(f"{symbol} -> SCORE {score} ({', '.join(reasons)})")
+                    # Added the sector to the Telegram alert
+                    signal = f"🚀 BUY SIGNAL\nSTOCK: {symbol} ({sector})\nPRICE: {round(close,2)}\nTARGET: {target}\nSTOPLOSS: {stoploss}\nRSI: {round(rsi,2)}\nSCORE: {score}/5"
+                    print(signal)
+                    send_telegram(signal)
+                    signals.append(f"{symbol} ({sector})")
+                else:
+                    rejections.append(f"{symbol} -> SCORE {score} ({', '.join(reasons)})")
 
-        except Exception as e:
-            print(f"{symbol} CRITICAL ERROR")
-            traceback.print_exc()
+            except Exception as e:
+                print(f"{symbol} CRITICAL ERROR")
+                traceback.print_exc()
 
     print("\n--- SCAN SUMMARY ---")
     print(f"TREND: {market_trend} | SIGNALS: {len(signals)} | REJECTIONS: {len(rejections)}")
 
 # =========================================================
-# 5. FIX: CONTINUOUS KEEP-ALIVE LOOP
+# CONTINUOUS KEEP-ALIVE LOOP
 # =========================================================
 while True:
     try:
@@ -253,5 +253,4 @@ while True:
         traceback.print_exc()
     
     print(f"\nWAITING 5 MINUTES... NEXT SCAN AT {(datetime.now() + timedelta(minutes=5)).strftime('%H:%M:%S')}")
-    # Sleep for 5 minutes before scanning again
     time.sleep(300)
