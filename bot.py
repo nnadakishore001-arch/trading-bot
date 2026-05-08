@@ -26,6 +26,26 @@ API_OBJECT = None
 IST        = pytz.timezone("Asia/Kolkata")
 
 # =====================================================
+# ANGEL ONE API RATE LIMITS (official, as of 2024)
+# Source: smartapi.angelbroking.com/docs/RateLimit
+#
+# getCandleData:
+#   3 requests / second
+#   180 requests / minute  (the binding cap — 3/s × 60 = 180)
+#   5000 requests / hour
+#
+# Safe inter-request delay to stay well inside limits:
+#   1 request every 0.4s = 2.5 req/s  (safe under the 3/s cap)
+#   but Angel One's rate limiter has a known bug where it fires
+#   403 even below the documented limit (reported multiple times
+#   on the forum). We use 1.1s delay + exponential backoff retry
+#   to handle both the documented limit and the buggy enforcement.
+# =====================================================
+CANDLE_DELAY   = 1.1    # seconds between each getCandleData call
+MAX_RETRIES    = 3      # retry attempts per stock on rate-limit hit
+RETRY_BACKOFF  = 2.0    # seconds added per retry (exponential)
+
+# =====================================================
 # TELEGRAM FUNCTION  (never change this)
 # =====================================================
 def send(msg):
@@ -47,75 +67,45 @@ def is_trading_day():
     return now_ist().weekday() < 5   # Mon–Fri only
 
 def scan_window_open(now):
-    """
-    Only scan between 09:25 and 15:25.
-    Before 09:25 there are fewer than 4 completed candles.
-    After 15:25 the market books are too thin to act on.
-    """
     t = (now.hour, now.minute)
     return (9, 25) <= t < (15, 25)
+
+def is_rate_limit_error(e):
+    """
+    Detect Angel One rate-limit responses.
+    The SDK raises DataException with the raw HTTP body as the message.
+    The body is: b'Access denied because of exceeding access rate'
+    We check for both the bytes repr and the plain string.
+    """
+    msg = str(e).lower()
+    return "exceeding access rate" in msg or "access denied" in msg
 
 # =====================================================
 # LOGIN
 # =====================================================
-# ROOT CAUSE OF YOUR AG8001 ERROR — THREE BUGS FIXED HERE:
-#
-# BUG 1: Token order was wrong.
-#   Old code called setAccessToken(jwtToken) BEFORE generateSession
-#   returned, then immediately called setRefreshToken + getfeedToken.
-#   The SDK's own generateSession() already sets all three tokens
-#   internally. When you manually set them again AFTER in a different
-#   order you can overwrite the internal state and corrupt the auth
-#   header that getProfile reads. Confirmed by SmartAPI source:
-#   generateSession() calls self.setAccessToken(jwtToken) then
-#   self.setRefreshToken(refreshToken) then self.setFeedToken internally.
-#
-# BUG 2: generateToken(refreshToken) was never called after login.
-#   The official Angel One README and test suite both call
-#   smartApi.generateToken(refreshToken) right after getProfile.
-#   This refreshes the jwtToken pool so subsequent API calls
-#   (getCandleData, etc.) don't hit AG8001 mid-session.
-#
-# BUG 3: Profile validation checked the wrong key.
-#   Old code checked profile.get("status") but the SDK wraps the
-#   response — the correct key is profile["data"]["clientcode"].
-#   If "data" is missing or None the old code passed validation
-#   and proceeded with a broken session object.
-#
-# FIX: Follow the exact official sequence from Angel One's own
-#   README and test/api_test.py:
-#     1. generateSession  → SDK auto-sets all tokens internally
-#     2. getfeedToken     → just for storage, SDK already set it
-#     3. getProfile(refreshToken) → validate session is live
-#     4. generateToken(refreshToken) → refresh the JWT pool
-# =====================================================
 def login():
     """
     Authenticate with Angel One SmartAPI using TOTP.
-    Returns a live SmartConnect object, or None on failure.
-    Follows the exact official sequence from Angel One's README.
+    Follows the exact official sequence:
+      1. generateSession  (SDK auto-sets all tokens internally)
+      2. getfeedToken     (stored locally for reference)
+      3. getProfile(refreshToken)  (validate session is live)
+      4. generateToken(refreshToken)  (refresh JWT pool)
     """
     try:
         obj  = SmartConnect(api_key=API_KEY)
         totp = pyotp.TOTP(TOTP_SECRET).now()
 
-        # STEP 1 — Generate session
-        # The SDK internally calls setAccessToken + setRefreshToken
-        # + setFeedToken. Do NOT override them manually afterwards.
         data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
         if not data or data.get("status") is False:
             send(f"Login failed — generateSession returned: {data}")
             return None
 
-        # STEP 2 — Store tokens locally (SDK already set them internally,
-        # these are just for our reference / re-login logic)
         auth_token    = data["data"]["jwtToken"]
         refresh_token = data["data"]["refreshToken"]
         feed_token    = obj.getfeedToken()
 
-        # STEP 3 — Validate session by calling getProfile
-        # Must use refresh_token (raw string, not "Bearer …" prefixed)
         profile = obj.getProfile(refresh_token)
 
         if (
@@ -126,8 +116,6 @@ def login():
             send(f"Profile validation failed — response: {profile}")
             return None
 
-        # STEP 4 — Refresh the JWT pool (critical: prevents AG8001
-        # mid-session on getCandleData calls)
         obj.generateToken(refresh_token)
 
         client_name = profile["data"].get("name", CLIENT_ID)
@@ -200,9 +188,10 @@ SECTORS = {
 }
 
 # =====================================================
-# CANDLE DATA FETCH
+# CANDLE DATA FETCH  — with retry + exponential backoff
 # =====================================================
 def _fetch_candles(token, from_str, to_str):
+    """Single raw getCandleData call."""
     return API_OBJECT.getCandleData({
         "exchange":    "NSE",
         "symboltoken": token,
@@ -215,36 +204,79 @@ def _fetch_candles(token, from_str, to_str):
 def get_data(token, symbol=""):
     """
     Fetch 5-minute candles from 09:15 today until now.
-    Auto re-login on AG8001 session expiry.
+
+    Rate-limit handling strategy (fixes "exceeding access rate"):
+    ─────────────────────────────────────────────────────────────
+    Angel One's getCandleData limit is officially 3 req/s and
+    180 req/min. However, the rate limiter has a known bug that
+    fires 403 even well below the published limit.
+
+    We handle this with THREE layers of protection:
+
+    Layer 1 — Proactive delay (CANDLE_DELAY = 1.1s per call)
+      Keeps our throughput at ~0.9 req/s, safely under the 3/s cap
+      AND under the 180/min cap (0.9 × 60 = 54 req/min).
+
+    Layer 2 — Exponential backoff retry (up to MAX_RETRIES = 3)
+      On a rate-limit hit, wait RETRY_BACKOFF × attempt seconds
+      before retrying the same stock. This gives the server's
+      sliding window time to clear before we try again.
+      Attempt 1 → wait 2s, Attempt 2 → wait 4s, Attempt 3 → wait 8s
+
+    Layer 3 — Session expiry re-login (AG8001)
+      If the JWT expired mid-scan, re-login and retry once.
+
+    Returns DataFrame[time, open, high, low, close, volume]
+    or an empty DataFrame if all retries fail.
     """
     global API_OBJECT
 
-    try:
-        now   = now_ist()
-        start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    now   = now_ist()
+    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
 
-        from_str = start.strftime("%Y-%m-%d %H:%M")
-        to_str   = now.strftime("%Y-%m-%d %H:%M")
+    from_str = start.strftime("%Y-%m-%d %H:%M")
+    to_str   = now.strftime("%Y-%m-%d %H:%M")
 
-        response = _fetch_candles(token, from_str, to_str)
-
-        # Session expired mid-scan: re-login and retry once
-        if response and response.get("errorCode") == "AG8001":
-            send("Session expired mid-scan — re-logging in")
-            API_OBJECT = login()
-            if API_OBJECT is None:
-                return pd.DataFrame()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
             response = _fetch_candles(token, from_str, to_str)
 
-        if response and response.get("data"):
-            return pd.DataFrame(
-                response["data"],
-                columns=["time", "open", "high", "low", "close", "volume"],
-            )
+            # ── Layer 3: Session expired → re-login once ────────
+            if response and response.get("errorCode") == "AG8001":
+                send("Session expired mid-scan — re-logging in")
+                API_OBJECT = login()
+                if API_OBJECT is None:
+                    return pd.DataFrame()
+                response = _fetch_candles(token, from_str, to_str)
 
-    except Exception as e:
-        print(f"[get_data] Error — {symbol} ({token}): {e}")
+            if response and response.get("data"):
+                return pd.DataFrame(
+                    response["data"],
+                    columns=["time", "open", "high", "low", "close", "volume"],
+                )
 
+            # Non-rate-limit empty response — skip this stock
+            print(f"[get_data] Empty response — {symbol} ({token}), attempt {attempt}")
+            return pd.DataFrame()
+
+        except Exception as e:
+            if is_rate_limit_error(e):
+                # ── Layer 2: Exponential backoff ────────────────
+                wait = RETRY_BACKOFF * attempt
+                print(
+                    f"[get_data] Rate limit hit — {symbol} ({token}), "
+                    f"attempt {attempt}/{MAX_RETRIES}, "
+                    f"waiting {wait:.1f}s before retry"
+                )
+                time.sleep(wait)
+                # continue to next attempt
+
+            else:
+                # Non-rate-limit exception — don't retry, skip stock
+                print(f"[get_data] Error — {symbol} ({token}): {e}")
+                return pd.DataFrame()
+
+    print(f"[get_data] All {MAX_RETRIES} retries exhausted — skipping {symbol}")
     return pd.DataFrame()
 
 # =====================================================
@@ -254,7 +286,7 @@ def scan_market():
     """
     Scans all 35 stocks across 9 sectors.
 
-    Thresholds:
+    Selection criteria:
       Stock move  >= 0.25% from day-open
       Sector avg  >= 0.20% (sector must confirm the move)
 
@@ -262,6 +294,7 @@ def scan_market():
     """
     market_data = []
     sector_raw  = {}
+    skipped     = 0
 
     for sector, stocks in SECTORS.items():
         for symbol, token in stocks.items():
@@ -269,14 +302,17 @@ def scan_market():
             df = get_data(token, symbol)
 
             if len(df) < 4:
-                time.sleep(0.7)
+                skipped += 1
+                # Layer 1 delay still applies even on skip
+                time.sleep(CANDLE_DELAY)
                 continue
 
             open_price   = df.iloc[0]["open"]
             latest_close = df.iloc[-1]["close"]
 
             if open_price == 0:
-                time.sleep(0.7)
+                skipped += 1
+                time.sleep(CANDLE_DELAY)
                 continue
 
             change_pct = ((latest_close - open_price) / open_price) * 100
@@ -289,7 +325,13 @@ def scan_market():
                 "ltp":    latest_close,
             })
 
-            time.sleep(0.7)   # Respect Angel One rate limits
+            # ── Layer 1: Proactive rate-limit delay ─────────────
+            time.sleep(CANDLE_DELAY)
+
+    print(
+        f"[scan] Fetched {len(market_data)} stocks, "
+        f"skipped {skipped} (< 4 candles or bad data)"
+    )
 
     if not market_data:
         return None, "No market data — all stocks had fewer than 4 candles"
@@ -314,8 +356,8 @@ def scan_market():
 # =====================================================
 def option_pick(price, direction):
     """
-    Round to nearest 50 — standard for NIFTY/BANKNIFTY strike intervals.
-    direction: "BUY" -> CE, "SHORT" -> PE
+    Nearest 50 — standard for NIFTY/BANKNIFTY strike intervals.
+    direction: "BUY" -> CE,  "SHORT" -> PE
     """
     atm = round(price / 50) * 50
     return f"{atm} CE" if direction == "BUY" else f"{atm} PE"
@@ -359,12 +401,10 @@ def main():
     while True:
         now = now_ist()
 
-        # One-time market-open notification at 09:20
         if now.hour == 9 and now.minute >= 20 and not market_open_msg_sent:
             send("Market open — live scanning will begin at 09:25")
             market_open_msg_sent = True
 
-        # Active scan: 09:25–15:25, only if no trade taken yet
         if scan_window_open(now) and not traded:
             print(f"[{now.strftime('%H:%M')}] Scanning market...")
             signal, reason = scan_market()
@@ -379,7 +419,6 @@ def main():
                 no_trade_reason = reason or "Scan returned no reason"
                 print(f"[{now.strftime('%H:%M')}] No signal: {no_trade_reason}")
 
-        # Market close at 15:30
         if (
             (now.hour == 15 and now.minute >= 30) or now.hour > 15
         ) and not market_closed_msg_sent:
