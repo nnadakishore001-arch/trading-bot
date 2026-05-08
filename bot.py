@@ -20,6 +20,11 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # =====================================================
+# GLOBAL API OBJECT
+# =====================================================
+API_OBJECT = None
+
+# =====================================================
 # TELEGRAM FUNCTION
 # =====================================================
 def send(msg):
@@ -42,6 +47,7 @@ def send(msg):
 def login():
 
     try:
+
         obj = SmartConnect(api_key=API_KEY)
 
         totp = pyotp.TOTP(TOTP_SECRET).now()
@@ -142,6 +148,8 @@ SECTORS = {
 # =====================================================
 def get_data(obj, token):
 
+    global API_OBJECT
+
     try:
 
         ist = pytz.timezone("Asia/Kolkata")
@@ -162,6 +170,28 @@ def get_data(obj, token):
             "fromdate": start.strftime("%Y-%m-%d %H:%M"),
             "todate": now.strftime("%Y-%m-%d %H:%M")
         })
+
+        # =====================================================
+        # TOKEN EXPIRED → AUTO RE-LOGIN
+        # =====================================================
+        if response.get("errorCode") == "AG8001":
+
+            send("♻️ Session Expired — Re-Logging")
+
+            obj = login()
+
+            API_OBJECT = obj
+
+            if obj is None:
+                return pd.DataFrame()
+
+            response = obj.getCandleData({
+                "exchange": "NSE",
+                "symboltoken": token,
+                "interval": "FIVE_MINUTE",
+                "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+                "todate": now.strftime("%Y-%m-%d %H:%M")
+            })
 
         if response and response.get("data"):
 
@@ -227,7 +257,7 @@ def scan_market(obj):
         return None, "No market data"
 
     # =====================================================
-    # SECTOR AVERAGE
+    # SECTOR STRENGTH
     # =====================================================
     sector_strength = {
         k: sum(v) / len(v)
@@ -278,7 +308,11 @@ def option_pick(price, direction):
 # =====================================================
 def main():
 
+    global API_OBJECT
+
     obj = login()
+
+    API_OBJECT = obj
 
     if obj is None:
         return
@@ -309,7 +343,7 @@ def main():
 
             if not traded:
 
-                signal, reason = scan_market(obj)
+                signal, reason = scan_market(API_OBJECT)
 
                 if signal:
 
