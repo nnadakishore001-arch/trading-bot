@@ -146,7 +146,7 @@ SECTORS = {
 # =====================================================
 # FETCH MARKET DATA
 # =====================================================
-def get_data(obj, token):
+def get_data(token):
 
     global API_OBJECT
 
@@ -163,7 +163,7 @@ def get_data(obj, token):
             microsecond=0
         )
 
-        response = obj.getCandleData({
+        response = API_OBJECT.getCandleData({
             "exchange": "NSE",
             "symboltoken": token,
             "interval": "FIVE_MINUTE",
@@ -174,18 +174,19 @@ def get_data(obj, token):
         # =====================================================
         # TOKEN EXPIRED → AUTO RE-LOGIN
         # =====================================================
-        if response.get("errorCode") == "AG8001":
+        if (
+            response and
+            response.get("errorCode") == "AG8001"
+        ):
 
             send("♻️ Session Expired — Re-Logging")
 
-            obj = login()
+            API_OBJECT = login()
 
-            API_OBJECT = obj
-
-            if obj is None:
+            if API_OBJECT is None:
                 return pd.DataFrame()
 
-            response = obj.getCandleData({
+            response = API_OBJECT.getCandleData({
                 "exchange": "NSE",
                 "symboltoken": token,
                 "interval": "FIVE_MINUTE",
@@ -216,7 +217,7 @@ def get_data(obj, token):
 # =====================================================
 # MARKET SCANNER
 # =====================================================
-def scan_market(obj):
+def scan_market():
 
     market_data = []
 
@@ -226,7 +227,7 @@ def scan_market(obj):
 
         for symbol, token in stocks.items():
 
-            df = get_data(obj, token)
+            df = get_data(token)
 
             if len(df) < 4:
                 continue
@@ -310,11 +311,9 @@ def main():
 
     global API_OBJECT
 
-    obj = login()
+    API_OBJECT = login()
 
-    API_OBJECT = obj
-
-    if obj is None:
+    if API_OBJECT is None:
         return
 
     ist = pytz.timezone("Asia/Kolkata")
@@ -343,7 +342,7 @@ def main():
 
             if not traded:
 
-                signal, reason = scan_market(API_OBJECT)
+                signal, reason = scan_market()
 
                 if signal:
 
