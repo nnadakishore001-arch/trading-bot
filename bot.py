@@ -30,6 +30,7 @@ API_OBJECT = None
 def send(msg):
 
     try:
+
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             data={
@@ -39,6 +40,7 @@ def send(msg):
         )
 
     except Exception as e:
+
         print("Telegram Error:", e)
 
 # =====================================================
@@ -58,19 +60,44 @@ def login():
             totp
         )
 
-        if data and data.get("status"):
+        if not data or not data.get("status"):
 
-            obj.setAccessToken(data['data']['jwtToken'])
-            obj.setRefreshToken(data['data']['refreshToken'])
-            obj.feed_token = data['data']['feedToken']
+            send("❌ Login Failed")
 
-            send("✅ Angel One Login Success")
+            return None
 
-            return obj
+        # =====================================================
+        # TOKENS
+        # =====================================================
+        auth_token = data['data']['jwtToken']
 
-        send("❌ Login Failed")
+        refresh_token = data['data']['refreshToken']
 
-        return None
+        feed_token = obj.getfeedToken()
+
+        # =====================================================
+        # SET TOKENS
+        # =====================================================
+        obj.setAccessToken(auth_token)
+
+        obj.setRefreshToken(refresh_token)
+
+        obj.feed_token = feed_token
+
+        # =====================================================
+        # PROFILE VALIDATION
+        # =====================================================
+        profile = obj.getProfile(refresh_token)
+
+        if not profile.get("status"):
+
+            send("❌ Profile Validation Failed")
+
+            return None
+
+        send("✅ Angel One Login Success")
+
+        return obj
 
     except Exception as e:
 
@@ -184,6 +211,7 @@ def get_data(token):
             API_OBJECT = login()
 
             if API_OBJECT is None:
+
                 return pd.DataFrame()
 
             response = API_OBJECT.getCandleData({
@@ -230,6 +258,7 @@ def scan_market():
             df = get_data(token)
 
             if len(df) < 4:
+
                 continue
 
             open_price = df.iloc[0]['open']
@@ -255,6 +284,7 @@ def scan_market():
             time.sleep(0.5)
 
     if not market_data:
+
         return None, "No market data"
 
     # =====================================================
@@ -280,6 +310,7 @@ def scan_market():
             signals.append(stock)
 
     if not signals:
+
         return None, "Low momentum"
 
     # =====================================================
@@ -300,6 +331,7 @@ def option_pick(price, direction):
     atm = round(price / 100) * 100
 
     if direction == "BUY":
+
         return f"{atm} CE"
 
     return f"{atm} PE"
@@ -314,6 +346,7 @@ def main():
     API_OBJECT = login()
 
     if API_OBJECT is None:
+
         return
 
     ist = pytz.timezone("Asia/Kolkata")
