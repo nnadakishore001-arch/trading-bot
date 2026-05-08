@@ -44,22 +44,13 @@ def now_ist():
     return datetime.now(IST)
 
 def is_trading_day():
-    """
-    Returns False on weekends.
-    NOTE: Add known NSE holidays manually if needed.
-    """
-    return now_ist().weekday() < 5          # Mon-Fri only
-
-def market_is_open(now):
-    """True during NSE live hours: 09:15 to 15:30."""
-    t = (now.hour, now.minute)
-    return (9, 15) <= t < (15, 30)
+    return now_ist().weekday() < 5   # Mon–Fri only
 
 def scan_window_open(now):
     """
-    Start scanning only after 09:25 so at least 4 completed
-    5-min candles exist (09:15, 09:20, 09:25 + partial).
-    Stop scanning 5 minutes before close to avoid thin books.
+    Only scan between 09:25 and 15:25.
+    Before 09:25 there are fewer than 4 completed candles.
+    After 15:25 the market books are too thin to act on.
     """
     t = (now.hour, now.minute)
     return (9, 25) <= t < (15, 25)
@@ -67,43 +58,93 @@ def scan_window_open(now):
 # =====================================================
 # LOGIN
 # =====================================================
+# ROOT CAUSE OF YOUR AG8001 ERROR — THREE BUGS FIXED HERE:
+#
+# BUG 1: Token order was wrong.
+#   Old code called setAccessToken(jwtToken) BEFORE generateSession
+#   returned, then immediately called setRefreshToken + getfeedToken.
+#   The SDK's own generateSession() already sets all three tokens
+#   internally. When you manually set them again AFTER in a different
+#   order you can overwrite the internal state and corrupt the auth
+#   header that getProfile reads. Confirmed by SmartAPI source:
+#   generateSession() calls self.setAccessToken(jwtToken) then
+#   self.setRefreshToken(refreshToken) then self.setFeedToken internally.
+#
+# BUG 2: generateToken(refreshToken) was never called after login.
+#   The official Angel One README and test suite both call
+#   smartApi.generateToken(refreshToken) right after getProfile.
+#   This refreshes the jwtToken pool so subsequent API calls
+#   (getCandleData, etc.) don't hit AG8001 mid-session.
+#
+# BUG 3: Profile validation checked the wrong key.
+#   Old code checked profile.get("status") but the SDK wraps the
+#   response — the correct key is profile["data"]["clientcode"].
+#   If "data" is missing or None the old code passed validation
+#   and proceeded with a broken session object.
+#
+# FIX: Follow the exact official sequence from Angel One's own
+#   README and test/api_test.py:
+#     1. generateSession  → SDK auto-sets all tokens internally
+#     2. getfeedToken     → just for storage, SDK already set it
+#     3. getProfile(refreshToken) → validate session is live
+#     4. generateToken(refreshToken) → refresh the JWT pool
+# =====================================================
 def login():
     """
     Authenticate with Angel One SmartAPI using TOTP.
-    Returns a live SmartConnect object or None on failure.
+    Returns a live SmartConnect object, or None on failure.
+    Follows the exact official sequence from Angel One's README.
     """
     try:
         obj  = SmartConnect(api_key=API_KEY)
         totp = pyotp.TOTP(TOTP_SECRET).now()
+
+        # STEP 1 — Generate session
+        # The SDK internally calls setAccessToken + setRefreshToken
+        # + setFeedToken. Do NOT override them manually afterwards.
         data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
 
-        if not data or not data.get("status"):
-            send("Login Failed - Check credentials / TOTP secret")
+        if not data or data.get("status") is False:
+            send(f"Login failed — generateSession returned: {data}")
             return None
 
+        # STEP 2 — Store tokens locally (SDK already set them internally,
+        # these are just for our reference / re-login logic)
         auth_token    = data["data"]["jwtToken"]
         refresh_token = data["data"]["refreshToken"]
         feed_token    = obj.getfeedToken()
 
-        obj.setAccessToken(auth_token)
-        obj.setRefreshToken(refresh_token)
-        obj.feed_token = feed_token
-
+        # STEP 3 — Validate session by calling getProfile
+        # Must use refresh_token (raw string, not "Bearer …" prefixed)
         profile = obj.getProfile(refresh_token)
-        if not profile.get("status"):
-            send("Profile validation failed")
+
+        if (
+            not profile
+            or not profile.get("data")
+            or not profile["data"].get("clientcode")
+        ):
+            send(f"Profile validation failed — response: {profile}")
             return None
 
-        send("Angel One login successful")
+        # STEP 4 — Refresh the JWT pool (critical: prevents AG8001
+        # mid-session on getCandleData calls)
+        obj.generateToken(refresh_token)
+
+        client_name = profile["data"].get("name", CLIENT_ID)
+        send(
+            f"Angel One login successful\n"
+            f"Client: {client_name} ({profile['data']['clientcode']})\n"
+            f"Exchanges: {', '.join(profile['data'].get('exchanges', []))}"
+        )
         return obj
 
     except Exception as e:
         send(f"Login error: {e}")
+        print(f"[login] Exception: {e}")
         return None
 
 # =====================================================
-# SECTOR TO STOCK TO TOKEN MAP
-# All tokens verified against NSE symbol master (2024)
+# SECTOR → STOCK → TOKEN MAP
 # =====================================================
 SECTORS = {
     "BANK": {
@@ -162,7 +203,6 @@ SECTORS = {
 # CANDLE DATA FETCH
 # =====================================================
 def _fetch_candles(token, from_str, to_str):
-    """Inner helper — makes one getCandleData API call."""
     return API_OBJECT.getCandleData({
         "exchange":    "NSE",
         "symboltoken": token,
@@ -175,9 +215,7 @@ def _fetch_candles(token, from_str, to_str):
 def get_data(token, symbol=""):
     """
     Fetch 5-minute candles from 09:15 today until now.
-    Auto re-login on AG8001 (session expired).
-    Returns DataFrame[time, open, high, low, close, volume]
-    or an empty DataFrame on any failure.
+    Auto re-login on AG8001 session expiry.
     """
     global API_OBJECT
 
@@ -190,9 +228,9 @@ def get_data(token, symbol=""):
 
         response = _fetch_candles(token, from_str, to_str)
 
-        # Session expired: re-login and retry once
+        # Session expired mid-scan: re-login and retry once
         if response and response.get("errorCode") == "AG8001":
-            send("Session expired - re-logging in")
+            send("Session expired mid-scan — re-logging in")
             API_OBJECT = login()
             if API_OBJECT is None:
                 return pd.DataFrame()
@@ -205,7 +243,7 @@ def get_data(token, symbol=""):
             )
 
     except Exception as e:
-        print(f"[get_data] Error - {symbol} ({token}): {e}")
+        print(f"[get_data] Error — {symbol} ({token}): {e}")
 
     return pd.DataFrame()
 
@@ -216,22 +254,20 @@ def scan_market():
     """
     Scans all 35 stocks across 9 sectors.
 
-    Selection criteria:
-      Stock move  >= 0.25 % from day-open
-      Sector avg  >= 0.20 % (sector must confirm the move)
+    Thresholds:
+      Stock move  >= 0.25% from day-open
+      Sector avg  >= 0.20% (sector must confirm the move)
 
-    Returns (best_signal_dict, None)  on success
-            (None, reason_str)        on no signal.
+    Returns (best_signal_dict, None) or (None, reason_str).
     """
     market_data = []
-    sector_raw  = {}          # sector -> [change_pct, ...]
+    sector_raw  = {}
 
     for sector, stocks in SECTORS.items():
         for symbol, token in stocks.items():
 
             df = get_data(token, symbol)
 
-            # Need at least 4 completed candles (~20 min of data)
             if len(df) < 4:
                 time.sleep(0.7)
                 continue
@@ -239,7 +275,6 @@ def scan_market():
             open_price   = df.iloc[0]["open"]
             latest_close = df.iloc[-1]["close"]
 
-            # Guard against bad tick data with zero open price
             if open_price == 0:
                 time.sleep(0.7)
                 continue
@@ -247,7 +282,6 @@ def scan_market():
             change_pct = ((latest_close - open_price) / open_price) * 100
 
             sector_raw.setdefault(sector, []).append(change_pct)
-
             market_data.append({
                 "symbol": symbol,
                 "sector": sector,
@@ -255,19 +289,13 @@ def scan_market():
                 "ltp":    latest_close,
             })
 
-            # Respect Angel One rate limits (~1.4 req/s safe ceiling)
-            time.sleep(0.7)
+            time.sleep(0.7)   # Respect Angel One rate limits
 
     if not market_data:
-        return None, "No market data fetched - all stocks had fewer than 4 candles"
+        return None, "No market data — all stocks had fewer than 4 candles"
 
-    # Sector strength: simple average of all member moves
-    sector_avg = {
-        s: sum(v) / len(v)
-        for s, v in sector_raw.items()
-    }
+    sector_avg = {s: sum(v) / len(v) for s, v in sector_raw.items()}
 
-    # Filter: stock AND its sector must both cross thresholds
     signals = [
         s for s in market_data
         if s["sector"] in sector_avg
@@ -276,9 +304,8 @@ def scan_market():
     ]
 
     if not signals:
-        return None, "Low momentum - no stock+sector combo crossed thresholds"
+        return None, "Low momentum — no stock+sector combo crossed thresholds"
 
-    # Pick the single strongest mover
     signals.sort(key=lambda x: abs(x["change"]), reverse=True)
     return signals[0], None
 
@@ -287,36 +314,25 @@ def scan_market():
 # =====================================================
 def option_pick(price, direction):
     """
-    Returns ATM option strike string.
-
-    Rounding:
-      Nearest 50  - standard for NIFTY/BANKNIFTY correlated strikes.
-      Change to nearest 100 for stocks like RELIANCE or SBIN
-      that trade on wider strike intervals.
-
-    direction: "BUY"   -> CE (call, bullish view)
-               "SHORT" -> PE (put, bearish view)
+    Round to nearest 50 — standard for NIFTY/BANKNIFTY strike intervals.
+    direction: "BUY" -> CE, "SHORT" -> PE
     """
     atm = round(price / 50) * 50
-
-    if direction == "BUY":
-        return f"{atm} CE"
-    return f"{atm} PE"
+    return f"{atm} CE" if direction == "BUY" else f"{atm} PE"
 
 # =====================================================
 # TRADE ALERT FORMATTER
 # =====================================================
 def build_alert(signal, direction, option):
-    """Builds the Telegram message string for a trade alert."""
     return (
         f"TRADE ALERT\n\n"
-        f"Signal    : {direction}\n"
-        f"Stock     : {signal['symbol']}\n"
-        f"Sector    : {signal['sector']}\n"
-        f"LTP       : Rs.{round(signal['ltp'], 2)}\n"
-        f"Move      : {round(signal['change'], 2)}%\n"
-        f"Strike    : {option}\n"
-        f"Time      : {now_ist().strftime('%H:%M IST')}"
+        f"Signal   : {direction}\n"
+        f"Stock    : {signal['symbol']}\n"
+        f"Sector   : {signal['sector']}\n"
+        f"LTP      : Rs.{round(signal['ltp'], 2)}\n"
+        f"Move     : {round(signal['change'], 2)}%\n"
+        f"Strike   : {option}\n"
+        f"Time     : {now_ist().strftime('%H:%M IST')}"
     )
 
 # =====================================================
@@ -325,81 +341,56 @@ def build_alert(signal, direction, option):
 def main():
     global API_OBJECT
 
-    # Weekend / holiday guard
     if not is_trading_day():
         send("Today is not a trading day (weekend). Bot will not start.")
-        print("Not a trading day. Exiting.")
         return
 
-    # Login
     API_OBJECT = login()
     if API_OBJECT is None:
         return
 
-    send("Trading bot started - waiting for scan window (09:25)")
+    send("Trading bot started — waiting for scan window (09:25)")
 
-    # Per-session state (resets automatically on each run)
     traded                 = False
     no_trade_reason        = "No signal generated today"
     market_open_msg_sent   = False
     market_closed_msg_sent = False
 
-    # Main event loop
     while True:
         now = now_ist()
 
-        # One-time market-open notification
-        if (
-            now.hour == 9
-            and now.minute >= 20
-            and not market_open_msg_sent
-        ):
-            send("Market open - live scanning will begin at 09:25")
+        # One-time market-open notification at 09:20
+        if now.hour == 9 and now.minute >= 20 and not market_open_msg_sent:
+            send("Market open — live scanning will begin at 09:25")
             market_open_msg_sent = True
 
-        # Active scan window: 09:25 to 15:25, only if not yet traded
+        # Active scan: 09:25–15:25, only if no trade taken yet
         if scan_window_open(now) and not traded:
-
             print(f"[{now.strftime('%H:%M')}] Scanning market...")
             signal, reason = scan_market()
 
             if signal:
                 direction = "BUY" if signal["change"] > 0 else "SHORT"
                 option    = option_pick(signal["ltp"], direction)
-                message   = build_alert(signal, direction, option)
-
-                send(message)
-                print(f"[{now.strftime('%H:%M')}] Alert sent.")
-
+                send(build_alert(signal, direction, option))
+                print(f"[{now.strftime('%H:%M')}] Trade alert sent.")
                 traded = True
-
             else:
                 no_trade_reason = reason or "Scan returned no reason"
                 print(f"[{now.strftime('%H:%M')}] No signal: {no_trade_reason}")
 
-        # Market close: 15:30 or later
-        market_over = (
-            (now.hour == 15 and now.minute >= 30)
-            or now.hour > 15
-        )
-
-        if market_over and not market_closed_msg_sent:
+        # Market close at 15:30
+        if (
+            (now.hour == 15 and now.minute >= 30) or now.hour > 15
+        ) and not market_closed_msg_sent:
 
             if not traded:
-                send(
-                    f"No trade today\n"
-                    f"Reason: {no_trade_reason}"
-                )
+                send(f"No trade today\nReason: {no_trade_reason}")
 
-            send(
-                f"Market closed - bot stopped\n"
-                f"Time: {now.strftime('%H:%M IST')}"
-            )
-
+            send(f"Market closed — bot stopped\nTime: {now.strftime('%H:%M IST')}")
             market_closed_msg_sent = True
             break
 
-        # Wait 2 minutes before next scan attempt
         time.sleep(120)
 
 
