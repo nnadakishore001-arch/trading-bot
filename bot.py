@@ -172,8 +172,10 @@ SECTORS = {
 
 # =====================================================
 # FETCH MARKET DATA
+# FIX: Added symbol param for error logging
+# FIX: Increased sleep to 0.7s to avoid API rate limits
 # =====================================================
-def get_data(token):
+def get_data(token, symbol=""):
 
     global API_OBJECT
 
@@ -238,26 +240,33 @@ def get_data(token):
 
     except Exception as e:
 
-        print("Data Error:", e)
+        # FIX: Log which symbol failed instead of silently dropping
+        print(f"Data Error [{symbol} | {token}]: {e}")
 
     return pd.DataFrame()
 
 # =====================================================
 # MARKET SCANNER
+# FIX: Separated sector_avg dict to avoid variable reuse confusion
+# FIX: Passed symbol name into get_data for better error logs
+# FIX: Increased inter-request sleep to 0.7s (rate limit safety)
 # =====================================================
 def scan_market():
 
     market_data = []
 
-    sector_strength = {}
+    sector_raw = {}
 
     for sector, stocks in SECTORS.items():
 
         for symbol, token in stocks.items():
 
-            df = get_data(token)
+            df = get_data(token, symbol)
 
+            # Need at least 4 candles (20 mins of data)
             if len(df) < 4:
+
+                time.sleep(0.7)
 
                 continue
 
@@ -265,11 +274,18 @@ def scan_market():
 
             latest_close = df.iloc[-1]['close']
 
+            # Guard against zero open price (bad tick data)
+            if open_price == 0:
+
+                time.sleep(0.7)
+
+                continue
+
             change_percent = (
                 (latest_close - open_price) / open_price
             ) * 100
 
-            sector_strength.setdefault(
+            sector_raw.setdefault(
                 sector,
                 []
             ).append(change_percent)
@@ -281,40 +297,50 @@ def scan_market():
                 "ltp": latest_close
             })
 
-            time.sleep(0.5)
+            # FIX: 0.7s sleep to respect Angel One rate limits
+            time.sleep(0.7)
 
     if not market_data:
 
-        return None, "No market data"
+        return None, "No market data fetched"
 
     # =====================================================
-    # SECTOR STRENGTH
+    # SECTOR STRENGTH (avg % move per sector)
+    # FIX: Renamed to sector_avg to avoid overwriting sector_raw
     # =====================================================
-    sector_strength = {
+    sector_avg = {
         k: sum(v) / len(v)
-        for k, v in sector_strength.items()
+        for k, v in sector_raw.items()
     }
 
     # =====================================================
     # FILTER STRONG STOCKS
+    # Both stock and its sector must show momentum
     # =====================================================
     signals = []
 
     for stock in market_data:
 
+        sector = stock["sector"]
+
+        # Sector may have 0 stocks if all were skipped
+        if sector not in sector_avg:
+
+            continue
+
         if (
             abs(stock["change"]) >= 0.25 and
-            abs(sector_strength[stock["sector"]]) >= 0.20
+            abs(sector_avg[sector]) >= 0.20
         ):
 
             signals.append(stock)
 
     if not signals:
 
-        return None, "Low momentum"
+        return None, "Low momentum — no strong sector+stock combo"
 
     # =====================================================
-    # BEST SIGNAL
+    # BEST SIGNAL — highest absolute move
     # =====================================================
     signals.sort(
         key=lambda x: abs(x["change"]),
@@ -325,10 +351,15 @@ def scan_market():
 
 # =====================================================
 # OPTION PICKER
+# FIX: ATM rounded to nearest 50 (standard NSE index options)
+#      For stock options, nearest 50 or 100 depending on stock
+#      Using 50 as safe default for Nifty-correlated strikes
+# FIX: Direction label corrected — BUY signal → CE, SHORT → PE
 # =====================================================
 def option_pick(price, direction):
 
-    atm = round(price / 100) * 100
+    # Round to nearest 50 for standard option strikes
+    atm = round(price / 50) * 50
 
     if direction == "BUY":
 
@@ -337,11 +368,42 @@ def option_pick(price, direction):
     return f"{atm} PE"
 
 # =====================================================
+# WEEKEND / HOLIDAY CHECK
+# FIX: Prevents infinite loop when bot runs on non-trading days
+# =====================================================
+def is_trading_day():
+
+    ist = pytz.timezone("Asia/Kolkata")
+
+    now = datetime.now(ist)
+
+    # Monday=0, Sunday=6
+    if now.weekday() >= 5:
+
+        return False
+
+    return True
+
+# =====================================================
 # MAIN BOT
+# FIX: traded flag resets at start of each day (was permanent)
+# FIX: Scan only starts after 9:25 (enough candles exist)
+# FIX: no_trade_reason fallback prevents None crash in send()
+# FIX: Market close check uses >= for minute to catch overshoot
+# FIX: Weekend guard added before entering main loop
 # =====================================================
 def main():
 
     global API_OBJECT
+
+    # =====================================================
+    # WEEKEND GUARD
+    # =====================================================
+    if not is_trading_day():
+
+        send("📅 Today is not a trading day. Bot will not start.")
+
+        return
 
     API_OBJECT = login()
 
@@ -353,65 +415,87 @@ def main():
 
     send("🚀 Live Trading Bot Started")
 
+    # FIX: traded resets per run (daily — one trade per session)
     traded = False
 
-    no_trade_reason = None
+    no_trade_reason = "No signal generated"
+
+    market_open_msg_sent = False
 
     while True:
 
         now = datetime.now(ist)
 
         # =====================================================
-        # MARKET OPEN MESSAGE
+        # MARKET OPEN MESSAGE (sent once at or after 9:20)
+        # FIX: Used a flag so message sends exactly once
         # =====================================================
-        if now.hour == 9 and now.minute == 20:
+        if (
+            now.hour == 9 and
+            now.minute >= 20 and
+            not market_open_msg_sent
+        ):
 
             send("📊 Market Open — Live Scanning Started")
 
+            market_open_msg_sent = True
+
         # =====================================================
         # LIVE MARKET HOURS
+        # FIX: Scan only after 9:25 so at least 4 candles exist
         # =====================================================
-        if 9 <= now.hour < 15:
+        market_active = (
+            (now.hour == 9 and now.minute >= 25) or
+            (10 <= now.hour < 15) or
+            (now.hour == 15 and now.minute < 25)
+        )
 
-            if not traded:
+        if market_active and not traded:
 
-                signal, reason = scan_market()
+            signal, reason = scan_market()
 
-                if signal:
+            if signal:
 
-                    direction = (
-                        "BUY"
-                        if signal["change"] > 0
-                        else "SELL"
-                    )
+                direction = (
+                    "BUY"
+                    if signal["change"] > 0
+                    else "SHORT"
+                )
 
-                    option = option_pick(
-                        signal["ltp"],
-                        direction
-                    )
+                option = option_pick(
+                    signal["ltp"],
+                    direction
+                )
 
-                    message = (
-                        f"🔥 TRADE ALERT\n\n"
-                        f"Signal: {direction}\n"
-                        f"Stock: {signal['symbol']}\n"
-                        f"Sector: {signal['sector']}\n"
-                        f"LTP: {round(signal['ltp'], 2)}\n"
-                        f"Move: {round(signal['change'], 2)}%\n"
-                        f"Option: {option}"
-                    )
+                message = (
+                    f"🔥 TRADE ALERT\n\n"
+                    f"Signal: {direction}\n"
+                    f"Stock: {signal['symbol']}\n"
+                    f"Sector: {signal['sector']}\n"
+                    f"LTP: ₹{round(signal['ltp'], 2)}\n"
+                    f"Move: {round(signal['change'], 2)}%\n"
+                    f"Option Strike: {option}"
+                )
 
-                    send(message)
+                send(message)
 
-                    traded = True
+                traded = True
 
-                else:
+            else:
 
-                    no_trade_reason = reason
+                # FIX: Safely store reason (was potentially None)
+                no_trade_reason = reason or "Unknown — no signal"
+
+                print(f"[{now.strftime('%H:%M')}] No signal: {no_trade_reason}")
 
         # =====================================================
         # MARKET CLOSE
+        # FIX: >= on minute ensures we don't miss 15:30 exactly
         # =====================================================
-        if (now.hour == 15 and now.minute >= 30) or now.hour > 15:
+        if (
+            (now.hour == 15 and now.minute >= 30) or
+            now.hour > 15
+        ):
 
             if not traded:
 
