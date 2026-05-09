@@ -18,13 +18,13 @@ TG_TOKEN    = os.getenv("TG_TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
 
 # BACKTEST SETTINGS
-BACKTEST_DAYS    = 15
-MAX_TRADES_DAILY = 2       # Limit to top 2 high-probability setups
-STOCK_MIN_MOVE   = 0.40    # Slightly higher to ensure trend strength
-STOCK_MAX_MOVE   = 2.00    # Prevent buying into exhaustion
+BACKTEST_DAYS    = 30
+MAX_TRADES_DAILY = 2       
+STOCK_MIN_MOVE   = 0.40    
+STOCK_MAX_MOVE   = 2.00    
 SECTOR_THRESHOLD = 0.25    
-STOP_LOSS_PCT    = 0.70    # Hard SL
-TARGET_PCT       = 1.50    # Target
+STOP_LOSS_PCT    = 0.70    
+TARGET_PCT       = 1.50    
 CANDLE_DELAY     = 1.1     
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -63,14 +63,17 @@ def login():
     except: return None
 
 def fetch_data(token, date_str):
+    """FIXED: Always returns a DataFrame to avoid AttributeError"""
     try:
         res = API.getCandleData({"exchange": "NSE", "symboltoken": token, "interval": "FIVE_MINUTE",
                                  "fromdate": f"{date_str} 09:15", "todate": f"{date_str} 15:30"})
-        if res.get("data"):
+        if res and res.get("status") and res.get("data"):
             df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df["time"] = pd.to_datetime(df["time"]).dt.tz_convert("Asia/Kolkata")
             return df
-    except: return pd.DataFrame()
+    except Exception as e:
+        print(f"Fetch Error for {token}: {e}")
+    return pd.DataFrame() # Returns empty DF instead of None
 
 def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -79,6 +82,10 @@ def compute_ema(series, period):
 # ENGINE
 # ─────────────────────────────────────────────
 API = login()
+if not API:
+    print("Login failed. Check credentials.")
+    exit()
+
 trading_days = []
 curr_date = datetime.now(IST).date()
 while len(trading_days) < BACKTEST_DAYS:
@@ -93,7 +100,8 @@ for date_str in reversed(trading_days):
     for sec, stocks in SECTORS.items():
         for sym, token in stocks.items():
             df = fetch_data(token, date_str)
-            if not df.empty: day_cache[sym] = {"df": df, "sector": sec}
+            if not df.empty: 
+                day_cache[sym] = {"df": df, "sector": sec}
             time.sleep(CANDLE_DELAY)
 
     # Simulation Window
@@ -104,7 +112,7 @@ for date_str in reversed(trading_days):
     for current_ts in time_steps:
         if daily_trades >= MAX_TRADES_DAILY: break
         
-        # Sector confirmation at current timestamp
+        # Sector moves at this timestamp
         sector_moves = {}
         for sym, data in day_cache.items():
             df_slice = data["df"][data["df"]["time"] <= current_ts]
@@ -113,39 +121,37 @@ for date_str in reversed(trading_days):
                 sector_moves.setdefault(data["sector"], []).append(move)
         sec_avgs = {sec: sum(m)/len(m) for sec, m in sector_moves.items()}
 
-        # Scan each stock
         for sym, data in day_cache.items():
             if daily_trades >= MAX_TRADES_DAILY: break
             if sym in active_symbols: continue
 
             df_s = data["df"][data["df"]["time"] <= current_ts]
-            if len(df_s) < 22: continue # Ensure enough data for EMA21
+            if len(df_s) < 22: continue 
 
             ema9 = compute_ema(df_s["close"], 9)
             ema21 = compute_ema(df_s["close"], 21)
             
-            # 1. EMA Crossover check
             crossover = None
             if ema9.iloc[-2] <= ema21.iloc[-2] and ema9.iloc[-1] > ema21.iloc[-1]: crossover = "BUY"
             elif ema9.iloc[-2] >= ema21.iloc[-2] and ema9.iloc[-1] < ema21.iloc[-1]: crossover = "SHORT"
 
             if not crossover: continue
 
-            # 2. Logic Filters
             ltp = df_s.iloc[-1]["close"]
             move = ((ltp - df_s.iloc[0]["open"]) / df_s.iloc[0]["open"]) * 100
             sec_move = sec_avgs.get(data["sector"], 0)
             
-            # Reversal check (Body > 30% of range)
+            # SunPharma Filter: Reversal check (Body > 30% of range)
             candle = df_s.iloc[-1]
-            body_range_ratio = abs(candle["close"] - candle["open"]) / (candle["high"] - candle["low"]) if (candle["high"]-candle["low"]) !=0 else 0
+            candle_range = (candle["high"] - candle["low"])
+            body_range_ratio = abs(candle["close"] - candle["open"]) / candle_range if candle_range != 0 else 0
 
             if abs(move) >= STOCK_MIN_MOVE and abs(move) <= STOCK_MAX_MOVE and abs(sec_move) >= SECTOR_THRESHOLD and body_range_ratio > 0.3:
                 # ENTRY FOUND
                 sl = ltp * (1 - STOP_LOSS_PCT/100) if crossover == "BUY" else ltp * (1 + STOP_LOSS_PCT/100)
                 tgt = ltp * (1 + TARGET_PCT/100) if crossover == "BUY" else ltp * (1 - TARGET_PCT/100)
                 
-                # Track Outcome
+                # Exit Logic
                 future = data["df"][data["df"]["time"] > current_ts]
                 exit_p = ltp
                 for _, row in future.iterrows():
@@ -163,7 +169,7 @@ for date_str in reversed(trading_days):
                 active_symbols.add(sym)
 
 # ─────────────────────────────────────────────
-# OUTPUT
+# OUTPUT FORMATTING
 # ─────────────────────────────────────────────
 if all_trades:
     res = pd.DataFrame(all_trades)
@@ -172,7 +178,9 @@ if all_trades:
     summary += "=========================================\n"
     summary += "      Date Entry Time      Symbol Direction  Entry Price  Exit Price  PnL %\n"
     for _, r in res.iterrows():
-        summary += f"{r['Date']}      {r['Time']}  {r['Sym']:>10}  {r['Dir']:>5}  {r['Entry']:>11}  {r['Exit']:>10}  {r['PnL']:>5}\n"
+        summary += f"{r['Date']}      {r['Time']}  {r['Sym']:>10}  {r['Dir']:>9}  {r['Entry']:>11}  {r['Exit']:>10}  {r['PnL']:>5}\n"
     summary += f"\n--- Summary ---\nTotal Trades : {len(res)}\nWins         : {wins}\nLosses       : {len(res)-wins}\nWin Rate     : {round(wins/len(res)*100,2)}%\nTotal PnL %  : {round(res['PnL'].sum(),2)}%"
     print(summary)
     send_telegram(summary)
+else:
+    print("No trades found.")
