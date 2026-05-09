@@ -1,31 +1,9 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║           BACKTEST BOT — 1 MONTH HISTORICAL REPLAY          ║
-║  Same strategy as production. Replays day-by-day, sends     ║
-║  real Telegram alerts with [BACKTEST] prefix so you can     ║
-║  track accuracy live without risking real capital.          ║
-╚══════════════════════════════════════════════════════════════╝
-
-HOW IT WORKS:
-  • Iterates over every trading day in the past 30 days
-  • For each day, replays 5-min candles from 09:25 → 15:15
-    in configurable time-steps (REPLAY_STEP_MIN)
-  • At each step, runs the EXACT same strategy filters
-  • Sends Telegram alert when signal fires (with [BACKTEST] tag)
-  • After each day, checks SL/Target hit using remaining candles
-  • Sends end-of-day result + cumulative P&L to Telegram
-  • Saves everything to backtest_results.db for analysis
-
-REQUIREMENTS:
-  pip install pandas pyotp requests smartapi-python pytz
-"""
-
 import os
 import sqlite3
 import pandas as pd
 import pyotp
 import requests
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 import pytz
 import time
@@ -44,7 +22,7 @@ CHAT_ID     = os.getenv("CHAT_ID")
 # BACKTEST CONFIG
 # ─────────────────────────────────────────────
 BACKTEST_DAYS    = 30          # how many calendar days to look back
-REPLAY_STEP_MIN  = 15          # simulate scanning every N minutes
+REPLAY_STEP_MIN  = 5           # FIX: Must match 5-min candles to avoid missing crossovers
 CANDLE_DELAY     = 1.1         # keep same rate-limit delay
 MAX_RETRIES      = 3
 RETRY_BACKOFF    = 2.0
@@ -250,7 +228,7 @@ def fetch_day_candles(token, symbol, trade_date):
                     resp["data"],
                     columns=["time","open","high","low","close","volume"]
                 )
-                df["time"] = pd.to_datetime(df["time"])
+                df["time"] = pd.to_datetime(df["time"]) # Returns TZ-aware timestamp
                 return df
             return pd.DataFrame()
         except Exception as e:
@@ -346,7 +324,8 @@ def recommend_strike(symbol, ltp, direction, atr, rsi, vol_ratio):
     recommended = "ITM" if use_itm else "ATM"
     strike_val  = itm  if use_itm else atm
     reasons     = []
-    if not strong_vol:   reasons.append(f"Vol {round(vol_ratio,1)}× < 3.5×")
+    # FIX: Replaced `<` with HTML entity `&lt;` to prevent Telegram Parse Error
+    if not strong_vol:   reasons.append(f"Vol {round(vol_ratio,1)}× &lt; 3.5×")
     if not rsi_momentum: reasons.append(f"RSI {round(rsi,1)} not peak")
     if not low_atr:      reasons.append(f"ATR {round(atr_pct,2)}% > 1%")
     reason = "; ".join(reasons) if reasons else "All ITM criteria met"
@@ -378,7 +357,6 @@ def build_params(ltp, direction, atr):
 
 # ══════════════════════════════════════════════
 # SIMULATE ONE TIME-SLICE
-# Checks all strategy filters on candles UP TO `upto_idx`
 # ══════════════════════════════════════════════
 def check_signal(df_slice, symbol, sector, open_price):
     """
@@ -400,15 +378,15 @@ def check_signal(df_slice, symbol, sector, open_price):
     atr        = get_atr(df_slice)
 
     if crossover is None:                                          return None
-    if abs(change) < STOCK_THRESHOLD:                             return None
-    if vol_ratio < VOLUME_SPIKE:                                  return None
-    if crossover == "BUY"   and not (RSI_BUY_MIN   <= rsi <= RSI_BUY_MAX):   return None
-    if crossover == "SHORT" and not (RSI_SHORT_MIN  <= rsi <= RSI_SHORT_MAX): return None
-    if last_candle_reversal(df_slice):                            return None
+    if abs(change) < STOCK_THRESHOLD:                              return None
+    if vol_ratio < VOLUME_SPIKE:                                   return None
+    if crossover == "BUY"   and not (RSI_BUY_MIN  <= rsi <= RSI_BUY_MAX):   return None
+    if crossover == "SHORT" and not (RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX): return None
+    if last_candle_reversal(df_slice):                             return None
     if not higher_highs_lower_lows(df_slice, crossover):         return None
-    if not no_big_gap(df_slice):                                  return None
-    if crossover == "BUY"   and change <= 0:                     return None
-    if crossover == "SHORT" and change >= 0:                     return None
+    if not no_big_gap(df_slice):                                   return None
+    if crossover == "BUY"   and change <= 0:                       return None
+    if crossover == "SHORT" and change >= 0:                       return None
 
     sl, target, sl_pct, tgt_pct = build_params(close_p, crossover, atr)
     strike_rec = recommend_strike(symbol, close_p, crossover, atr, rsi, vol_ratio)
@@ -452,11 +430,11 @@ def simulate_exit(df_full, signal_idx, direction, sl, target):
                 return "LOSS", sl, ts
             if lo <= target:
                 return "WIN",  target, ts
+                
     # Neither hit → use last close as exit
     last = df_full.iloc[-1]
     exit_p  = last["close"]
     exit_ts = str(last["time"])
-    entry   = signal_idx  # just for context
     ltp     = df_full.iloc[signal_idx]["close"]
     pnl     = ((exit_p - ltp) / ltp) * 100 if direction == "BUY" else ((ltp - exit_p) / ltp) * 100
     result  = "WIN" if pnl > 0 else "LOSS"
@@ -615,9 +593,9 @@ def run_backtest():
             print(f"[backtest] No data for {date_str} — skipping")
             continue
 
-        # Replay time-steps from 09:25 to 15:15
-        scan_start = datetime.strptime(f"{date_str} 09:25", "%Y-%m-%d %H:%M")
-        scan_end   = datetime.strptime(f"{date_str} 15:15", "%Y-%m-%d %H:%M")
+        # FIX: Explicitly localize scan_start and scan_end to match Pandas TZ-aware time data
+        scan_start = IST.localize(datetime.strptime(f"{date_str} 09:25", "%Y-%m-%d %H:%M"))
+        scan_end   = IST.localize(datetime.strptime(f"{date_str} 15:15", "%Y-%m-%d %H:%M"))
         step       = timedelta(minutes=REPLAY_STEP_MIN)
         current_ts = scan_start
 
@@ -720,7 +698,6 @@ def run_backtest():
     print("\n[backtest] ══ COMPLETE ══")
     for result, s in stats.items():
         print(f"  {result}: {s['count']} trades, avg P&L: {s['avg_pnl']}%")
-
 
 # ══════════════════════════════════════════════
 # ENTRY POINT
