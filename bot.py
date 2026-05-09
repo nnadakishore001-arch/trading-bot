@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import pandas as pd
 import pyotp
 import requests
@@ -8,699 +7,232 @@ from SmartApi import SmartConnect
 import pytz
 import time
 
-# ─────────────────────────────────────────────
-# ENV VARIABLES  (same as production)
-# ─────────────────────────────────────────────
+# =====================================================
+# ENV VARIABLES
+# =====================================================
 API_KEY     = os.getenv("API_KEY")
 CLIENT_ID   = os.getenv("CLIENT_ID")
 PASSWORD    = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
-TG_TOKEN    = os.getenv("TG_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
 
-# ─────────────────────────────────────────────
-# BACKTEST CONFIG
-# ─────────────────────────────────────────────
-BACKTEST_DAYS    = 30          # how many calendar days to look back
-REPLAY_STEP_MIN  = 5           # FIX: Must match 5-min candles to avoid missing crossovers
-CANDLE_DELAY     = 1.1         # keep same rate-limit delay
-MAX_RETRIES      = 3
-RETRY_BACKOFF    = 2.0
-DB_PATH          = "backtest_results.db"
+# =====================================================
+# BACKTEST CONFIGURATION
+# =====================================================
+BACKTEST_DAYS = 30      # Number of previous trading days to test
+CANDLE_DELAY  = 1.1     # Essential delay to prevent Angel One 403 blocks
+MAX_RETRIES   = 3
+RETRY_BACKOFF = 2.0
 
-# ─────────────────────────────────────────────
-# STRATEGY SETTINGS  (identical to production)
-# ─────────────────────────────────────────────
-STOCK_THRESHOLD    = 0.30
-SECTOR_THRESHOLD   = 0.25
-EMA_FAST           = 9
-EMA_SLOW           = 21
-VOLUME_SPIKE       = 2.5
-RSI_PERIOD         = 14
-RSI_BUY_MIN        = 55
-RSI_BUY_MAX        = 75
-RSI_SHORT_MIN      = 25
-RSI_SHORT_MAX      = 45
-MIN_CANDLES_NEEDED = 25
-SL_MULT            = 1.5       # ATR multiplier for stop-loss
-TGT_MULT           = 2.5       # ATR multiplier for target
-SL_PCT_FALLBACK    = 0.30
-TGT_PCT_FALLBACK   = 0.60
-
-# ─────────────────────────────────────────────
-# GLOBALS
-# ─────────────────────────────────────────────
 API_OBJECT = None
 IST        = pytz.timezone("Asia/Kolkata")
 
-# ─────────────────────────────────────────────
-# NSE HOLIDAYS
-# ─────────────────────────────────────────────
-NSE_HOLIDAYS = {
-    datetime(2025, 1, 26).date(), datetime(2025, 2, 26).date(),
-    datetime(2025, 3, 14).date(), datetime(2025, 3, 31).date(),
-    datetime(2025, 4, 10).date(), datetime(2025, 4, 14).date(),
-    datetime(2025, 4, 18).date(), datetime(2025, 5, 1).date(),
-    datetime(2025, 8, 15).date(), datetime(2025, 8, 27).date(),
-    datetime(2025, 10, 2).date(), datetime(2025, 10, 21).date(),
-    datetime(2025, 10, 22).date(), datetime(2025, 11, 5).date(),
-    datetime(2025, 12, 25).date(),
-    datetime(2026, 1, 26).date(), datetime(2026, 3, 20).date(),
-    datetime(2026, 4, 2).date(),  datetime(2026, 4, 3).date(),
-    datetime(2026, 4, 14).date(), datetime(2026, 5, 1).date(),
-    datetime(2026, 8, 15).date(), datetime(2026, 8, 26).date(),
-    datetime(2026, 10, 2).date(), datetime(2026, 12, 25).date(),
-}
-
-# ─────────────────────────────────────────────
-# STRIKE INTERVALS
-# ─────────────────────────────────────────────
-STRIKE_INTERVALS = {
-    "HDFCBANK": 50,  "ICICIBANK": 50,  "SBIN": 50,    "AXISBANK": 50,
-    "KOTAKBANK": 50, "TCS": 50,        "INFY": 50,    "HCLTECH": 50,
-    "TECHM": 50,     "WIPRO": 10,      "TATAMOTORS": 50, "MARUTI": 100,
-    "M&M": 50,       "BAJAJ-AUTO": 50, "SUNPHARMA": 50,  "CIPLA": 50,
-    "DRREDDY": 50,   "DIVISLAB": 100,  "ITC": 5,         "HINDUNILVR": 50,
-    "NESTLEIND": 50, "TATASTEEL": 10,  "JSWSTEEL": 50,   "HINDALCO": 10,
-    "RELIANCE": 50,  "ONGC": 10,       "NTPC": 10,       "POWERGRID": 10,
-    "BAJFINANCE": 50,"BAJAJFINSV": 50, "LT": 100,        "ADANIPORTS": 50,
-}
-
-# ─────────────────────────────────────────────
-# SECTORS
-# ─────────────────────────────────────────────
+# =====================================================
+# SECTORS (Same as Live)
+# =====================================================
 SECTORS = {
-    "BANK":   {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
-    "IT":     {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
-    "AUTO":   {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669"},
-    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694","DRREDDY":"881","DIVISLAB":"10940"},
-    "FMCG":   {"ITC":"1660","HINDUNILVR":"1394","NESTLEIND":"17963"},
-    "METAL":  {"TATASTEEL":"3499","JSWSTEEL":"11723","HINDALCO":"1363"},
-    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630","POWERGRID":"14977"},
-    "NBFC":   {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
-    "INFRA":  {"LT":"11483","ADANIPORTS":"15083"},
+    "BANK": {"HDFCBANK":"1333", "ICICIBANK":"4963", "SBIN":"3045", "AXISBANK":"5900", "KOTAKBANK":"1922"},
+    "IT": {"TCS":"11536", "INFY":"1594", "HCLTECH":"7229", "TECHM":"13538", "WIPRO":"3787"},
+    "AUTO": {"TATAMOTORS":"3456", "MARUTI":"10999", "M&M":"2031", "BAJAJ-AUTO":"16669"},
+    "PHARMA": {"SUNPHARMA":"3351", "CIPLA":"694", "DRREDDY":"881", "DIVISLAB":"10940"},
+    "FMCG": {"ITC":"1660", "HINDUNILVR":"1394", "NESTLEIND":"17963"},
+    "METAL": {"TATASTEEL":"3499", "JSWSTEEL":"11723", "HINDALCO":"1363"},
+    "ENERGY": {"RELIANCE":"2885", "ONGC":"2475", "NTPC":"11630", "POWERGRID":"14977"},
+    "NBFC": {"BAJFINANCE":"317", "BAJAJFINSV":"16675"},
+    "INFRA": {"LT":"11483", "ADANIPORTS":"15083"},
 }
 
-# ══════════════════════════════════════════════
-# DATABASE
-# ══════════════════════════════════════════════
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS bt_trades (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_date   TEXT,
-            signal_time  TEXT,
-            symbol       TEXT,
-            sector       TEXT,
-            direction    TEXT,
-            entry_price  REAL,
-            recommended  TEXT,
-            strike       TEXT,
-            sl_price     REAL,
-            target_price REAL,
-            sl_pct       REAL,
-            tgt_pct      REAL,
-            rsi          REAL,
-            vol_ratio    REAL,
-            atr          REAL,
-            result       TEXT,
-            exit_price   REAL,
-            exit_time    TEXT,
-            pnl_pct      REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_trade(t):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT INTO bt_trades
-        (trade_date,signal_time,symbol,sector,direction,entry_price,
-         recommended,strike,sl_price,target_price,sl_pct,tgt_pct,
-         rsi,vol_ratio,atr,result,exit_price,exit_time,pnl_pct)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        t["date"], t["signal_time"], t["symbol"], t["sector"],
-        t["direction"], t["entry"],
-        t["recommended"], t["strike"],
-        t["sl"], t["target"], t["sl_pct"], t["tgt_pct"],
-        t["rsi"], t["vol_ratio"], t["atr"] or 0,
-        t["result"], t["exit_price"], t["exit_time"], t["pnl_pct"],
-    ))
-    conn.commit()
-    conn.close()
-
-def get_summary():
-    conn  = sqlite3.connect(DB_PATH)
-    rows  = conn.execute(
-        "SELECT result, COUNT(*), AVG(pnl_pct) FROM bt_trades GROUP BY result"
-    ).fetchall()
-    conn.close()
-    stats = {}
-    for result, cnt, avg_pnl in rows:
-        stats[result] = {"count": cnt, "avg_pnl": round(avg_pnl or 0, 2)}
-    return stats
-
-# ══════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════
-def send(msg):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"[telegram] {e}")
-
-# ══════════════════════════════════════════════
+# =====================================================
 # LOGIN
-# ══════════════════════════════════════════════
+# =====================================================
 def login():
-    global API_OBJECT
+    print("Logging into Angel One SmartAPI...")
     try:
         obj  = SmartConnect(api_key=API_KEY)
         totp = pyotp.TOTP(TOTP_SECRET).now()
         data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
         if not data or data.get("status") is False:
-            print(f"[login] Failed: {data}")
-            return False
+            print("Login failed.")
+            return None
+            
         rf = data["data"]["refreshToken"]
         obj.getfeedToken()
         obj.getProfile(rf)
         obj.generateToken(rf)
-        API_OBJECT = obj
-        print("[login] OK")
-        return True
+        print("Login Successful!")
+        return obj
     except Exception as e:
-        print(f"[login] Exception: {e}")
-        return False
+        print(f"Login error: {e}")
+        return None
 
-# ══════════════════════════════════════════════
-# CANDLE FETCH — historical range
-# ══════════════════════════════════════════════
-def fetch_day_candles(token, symbol, trade_date):
-    """
-    Fetches ALL 5-min candles for a specific historical date.
-    Returns DataFrame or empty DataFrame on failure.
-    """
+# =====================================================
+# DATA FETCHING
+# =====================================================
+def fetch_historical_day(token, symbol, date_str):
+    """Fetches a full single day of 5-min candles."""
     global API_OBJECT
-    from_str = f"{trade_date} 09:15"
-    to_str   = f"{trade_date} 15:30"
+    from_str = f"{date_str} 09:15"
+    to_str   = f"{date_str} 15:30"
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = API_OBJECT.getCandleData({
                 "exchange": "NSE", "symboltoken": token,
-                "interval": "FIVE_MINUTE",
-                "fromdate": from_str, "todate": to_str,
+                "interval": "FIVE_MINUTE", "fromdate": from_str, "todate": to_str
             })
-            if resp and resp.get("errorCode") == "AG8001":
-                print("[session] Expired — re-logging")
-                if not login():
-                    return pd.DataFrame()
-                continue
+            
             if resp and resp.get("data"):
-                df = pd.DataFrame(
-                    resp["data"],
-                    columns=["time","open","high","low","close","volume"]
-                )
-                df["time"] = pd.to_datetime(df["time"]) # Returns TZ-aware timestamp
+                df = pd.DataFrame(resp["data"], columns=["time", "open", "high", "low", "close", "volume"])
+                df["time"] = pd.to_datetime(df["time"])
                 return df
             return pd.DataFrame()
+            
         except Exception as e:
             msg = str(e).lower()
             if "exceeding access rate" in msg or "access denied" in msg:
-                wait = RETRY_BACKOFF * attempt
-                print(f"[rate_limit] {symbol} attempt {attempt}, wait {wait}s")
-                time.sleep(wait)
+                time.sleep(RETRY_BACKOFF * attempt)
             else:
-                print(f"[fetch] {symbol} {trade_date}: {e}")
                 return pd.DataFrame()
     return pd.DataFrame()
 
-# ══════════════════════════════════════════════
-# INDICATORS  (identical to production)
-# ══════════════════════════════════════════════
-def compute_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    ag    = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    al    = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs    = ag / al.replace(0, 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def has_ema_crossover(df):
-    if len(df) < EMA_SLOW + 2:
-        return None
-    ef = compute_ema(df["close"], EMA_FAST)
-    es = compute_ema(df["close"], EMA_SLOW)
-    if ef.iloc[-2] <= es.iloc[-2] and ef.iloc[-1] > es.iloc[-1]:
-        return "BUY"
-    if ef.iloc[-2] >= es.iloc[-2] and ef.iloc[-1] < es.iloc[-1]:
-        return "SHORT"
-    return None
-
-def get_volume_ratio(df):
-    if len(df) < 3:
-        return 0
-    avg = df["volume"].iloc[:-1].mean()
-    return df["volume"].iloc[-1] / avg if avg > 0 else 0
-
-def last_candle_reversal(df):
-    if df.empty:
-        return False
-    c   = df.iloc[-1]
-    rng = c["high"] - c["low"]
-    return (abs(c["close"] - c["open"]) / rng < 0.30) if rng > 0 else True
-
-def higher_highs_lower_lows(df, direction, lookback=5):
-    if len(df) < lookback + 1:
-        return True
-    if direction == "BUY":
-        h = df["high"].iloc[-lookback:].values
-        return all(h[i] <= h[i+1] for i in range(len(h)-1))
-    l = df["low"].iloc[-lookback:].values
-    return all(l[i] >= l[i+1] for i in range(len(l)-1))
-
-def no_big_gap(df, gap_pct=0.50):
-    if df.empty:
-        return True
-    c   = df.iloc[-1]
-    rng = abs(c["close"] - c["open"]) / c["open"] * 100 if c["open"] > 0 else 0
-    return rng <= gap_pct
-
-def get_atr(df, period=14):
-    if len(df) < period + 1:
-        return None
-    h, l, c = df["high"], df["low"], df["close"]
-    p = c.shift(1)
-    tr = pd.concat([h - l, (h - p).abs(), (l - p).abs()], axis=1).max(axis=1)
-    val = tr.rolling(period).mean().iloc[-1]
-    return float(val) if pd.notna(val) else None
-
-# ══════════════════════════════════════════════
-# STRIKE RECOMMENDATION  (identical to production)
-# ══════════════════════════════════════════════
-def recommend_strike(symbol, ltp, direction, atr, rsi, vol_ratio):
-    interval = STRIKE_INTERVALS.get(symbol, 50)
-    opt_type = "CE" if direction == "BUY" else "PE"
-    atm      = round(ltp / interval) * interval
-    itm      = (atm - interval) if direction == "BUY" else (atm + interval)
-
-    atr_pct      = (atr / ltp * 100) if atr and ltp > 0 else 999
-    strong_vol   = vol_ratio >= 3.5
-    rsi_momentum = (60 <= rsi <= 72) if direction == "BUY" else (28 <= rsi <= 40)
-    low_atr      = atr_pct <= 1.0
-    use_itm      = strong_vol and rsi_momentum and low_atr
-
-    recommended = "ITM" if use_itm else "ATM"
-    strike_val  = itm  if use_itm else atm
-    reasons     = []
-    # FIX: Replaced `<` with HTML entity `&lt;` to prevent Telegram Parse Error
-    if not strong_vol:   reasons.append(f"Vol {round(vol_ratio,1)}× &lt; 3.5×")
-    if not rsi_momentum: reasons.append(f"RSI {round(rsi,1)} not peak")
-    if not low_atr:      reasons.append(f"ATR {round(atr_pct,2)}% > 1%")
-    reason = "; ".join(reasons) if reasons else "All ITM criteria met"
-
-    return {
-        "recommended":  recommended,
-        "strike_label": f"{strike_val} {opt_type}",
-        "atm_strike":   f"{atm} {opt_type}",
-        "itm_strike":   f"{itm} {opt_type}",
-        "reason":       reason,
-    }
-
-# ══════════════════════════════════════════════
-# TRADE PARAM BUILDER
-# ══════════════════════════════════════════════
-def build_params(ltp, direction, atr):
-    if atr and atr > 0:
-        sl_d  = round(SL_MULT  * atr, 2)
-        tgt_d = round(TGT_MULT * atr, 2)
-        sl     = round(ltp - sl_d,  2) if direction == "BUY" else round(ltp + sl_d,  2)
-        target = round(ltp + tgt_d, 2) if direction == "BUY" else round(ltp - tgt_d, 2)
-        sl_pct  = round(sl_d  / ltp * 100, 2)
-        tgt_pct = round(tgt_d / ltp * 100, 2)
-    else:
-        sl      = round(ltp * (1 - SL_PCT_FALLBACK/100),  2) if direction == "BUY" else round(ltp * (1 + SL_PCT_FALLBACK/100),  2)
-        target  = round(ltp * (1 + TGT_PCT_FALLBACK/100), 2) if direction == "BUY" else round(ltp * (1 - TGT_PCT_FALLBACK/100), 2)
-        sl_pct, tgt_pct = SL_PCT_FALLBACK, TGT_PCT_FALLBACK
-    return sl, target, sl_pct, tgt_pct
-
-# ══════════════════════════════════════════════
-# SIMULATE ONE TIME-SLICE
-# ══════════════════════════════════════════════
-def check_signal(df_slice, symbol, sector, open_price):
-    """
-    Runs all 8 strategy filters on a slice of candles.
-    Returns signal dict or None.
-    """
-    if len(df_slice) < MIN_CANDLES_NEEDED:
-        return None
-
-    if open_price == 0:
-        return None
-
-    close_p    = df_slice.iloc[-1]["close"]
-    change     = ((close_p - open_price) / open_price) * 100
-    rsi_series = compute_rsi(df_slice["close"], RSI_PERIOD)
-    rsi        = rsi_series.iloc[-1]
-    crossover  = has_ema_crossover(df_slice)
-    vol_ratio  = get_volume_ratio(df_slice)
-    atr        = get_atr(df_slice)
-
-    if crossover is None:                                          return None
-    if abs(change) < STOCK_THRESHOLD:                              return None
-    if vol_ratio < VOLUME_SPIKE:                                   return None
-    if crossover == "BUY"   and not (RSI_BUY_MIN  <= rsi <= RSI_BUY_MAX):   return None
-    if crossover == "SHORT" and not (RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX): return None
-    if last_candle_reversal(df_slice):                             return None
-    if not higher_highs_lower_lows(df_slice, crossover):         return None
-    if not no_big_gap(df_slice):                                   return None
-    if crossover == "BUY"   and change <= 0:                       return None
-    if crossover == "SHORT" and change >= 0:                       return None
-
-    sl, target, sl_pct, tgt_pct = build_params(close_p, crossover, atr)
-    strike_rec = recommend_strike(symbol, close_p, crossover, atr, rsi, vol_ratio)
-
-    return {
-        "symbol":    symbol,
-        "sector":    sector,
-        "direction": crossover,
-        "ltp":       close_p,
-        "change":    change,
-        "rsi":       rsi,
-        "vol_ratio": vol_ratio,
-        "atr":       atr,
-        "sl":        sl,
-        "target":    target,
-        "sl_pct":    sl_pct,
-        "tgt_pct":   tgt_pct,
-        "strike_rec":strike_rec,
-    }
-
-# ══════════════════════════════════════════════
-# SIMULATE EXIT — scan remaining candles for SL/Target hit
-# ══════════════════════════════════════════════
-def simulate_exit(df_full, signal_idx, direction, sl, target):
-    """
-    After signal fires at candle `signal_idx`, walk forward through
-    remaining candles and check if SL or Target is hit first.
-    Returns (result, exit_price, exit_time).
-    """
-    remaining = df_full.iloc[signal_idx + 1:]
-    for _, row in remaining.iterrows():
-        hi, lo = row["high"], row["low"]
-        ts = str(row["time"])
-        if direction == "BUY":
-            if lo <= sl:
-                return "LOSS", sl, ts
-            if hi >= target:
-                return "WIN",  target, ts
-        else:
-            if hi >= sl:
-                return "LOSS", sl, ts
-            if lo <= target:
-                return "WIN",  target, ts
-                
-    # Neither hit → use last close as exit
-    last = df_full.iloc[-1]
-    exit_p  = last["close"]
-    exit_ts = str(last["time"])
-    ltp     = df_full.iloc[signal_idx]["close"]
-    pnl     = ((exit_p - ltp) / ltp) * 100 if direction == "BUY" else ((ltp - exit_p) / ltp) * 100
-    result  = "WIN" if pnl > 0 else "LOSS"
-    return result, exit_p, exit_ts
-
-# ══════════════════════════════════════════════
-# ALERT FORMATTERS
-# ══════════════════════════════════════════════
-def fmt_signal(signal, trade_date, signal_time):
-    rec = signal["strike_rec"]
-    d   = signal["direction"]
-    rr  = round(signal["tgt_pct"] / signal["sl_pct"], 1) if signal["sl_pct"] else "N/A"
-    if rec["recommended"] == "ITM":
-        strike_block = (
-            f"🎯 <b>Recommended: ITM</b>\n"
-            f"  Strike  : {rec['itm_strike']}\n"
-            f"  ATM alt : {rec['atm_strike']}\n"
-            f"  Reason  : {rec['reason']}"
-        )
-    else:
-        strike_block = (
-            f"🎯 <b>Recommended: ATM</b>\n"
-            f"  Strike  : {rec['atm_strike']}\n"
-            f"  ITM alt : {rec['itm_strike']} (avoid)\n"
-            f"  Reason  : {rec['reason']}"
-        )
-    return (
-        f"🔁 <b>[BACKTEST] TRADE ALERT</b>\n"
-        f"📅 {trade_date}  ⏰ {signal_time}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Direction : {'🟢 BUY (CE)' if d == 'BUY' else '🔴 SHORT (PE)'}\n"
-        f"Stock     : <b>{signal['symbol']}</b> ({signal['sector']})\n"
-        f"LTP       : ₹{round(signal['ltp'], 2)}\n"
-        f"Day Move  : {round(signal['change'], 2)}%\n"
-        f"\n{strike_block}\n\n"
-        f"<b>Levels</b>\n"
-        f"Entry  : ₹{round(signal['ltp'], 2)}\n"
-        f"SL     : ₹{signal['sl']} (−{signal['sl_pct']}%)\n"
-        f"Target : ₹{signal['target']} (+{signal['tgt_pct']}%)\n"
-        f"ATR 14 : ₹{round(signal['atr'], 2) if signal['atr'] else 'N/A'}\n"
-        f"R:R    : 1 : {rr}\n\n"
-        f"<b>Signal Quality</b>\n"
-        f"RSI    : {round(signal['rsi'], 1)}\n"
-        f"Volume : {round(signal['vol_ratio'], 1)}× avg\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-
-def fmt_result(trade, pnl_pct):
-    emoji  = "✅" if trade["result"] == "WIN" else "❌"
-    return (
-        f"{emoji} <b>[BACKTEST] {trade['result']}</b>\n"
-        f"Symbol : {trade['symbol']}  {trade['direction']}\n"
-        f"Entry  : ₹{trade['entry']}  →  Exit: ₹{trade['exit_price']}\n"
-        f"P&amp;L    : {'+' if pnl_pct >= 0 else ''}{round(pnl_pct, 2)}%\n"
-        f"Exit at: {trade['exit_time']}"
-    )
-
-def fmt_day_summary(date_str, day_trades, cum_trades):
-    wins   = sum(1 for t in day_trades if t["result"] == "WIN")
-    losses = len(day_trades) - wins
-    pnl    = sum(t["pnl_pct"] for t in day_trades)
-    wr     = round(wins / len(day_trades) * 100) if day_trades else 0
-
-    cum_w  = sum(1 for t in cum_trades if t["result"] == "WIN")
-    cum_l  = len(cum_trades) - cum_w
-    cum_wr = round(cum_w / len(cum_trades) * 100) if cum_trades else 0
-    cum_pnl= sum(t["pnl_pct"] for t in cum_trades)
-
-    return (
-        f"📊 <b>[BACKTEST] Day Summary — {date_str}</b>\n"
-        f"Trades  : {len(day_trades)}  |  W: {wins}  L: {losses}\n"
-        f"Win Rate: {wr}%\n"
-        f"Day P&amp;L : {'+' if pnl >= 0 else ''}{round(pnl, 2)}%\n"
-        f"─────────────────────\n"
-        f"<b>Cumulative so far</b>\n"
-        f"Trades  : {len(cum_trades)}  |  W: {cum_w}  L: {cum_l}\n"
-        f"Win Rate: {cum_wr}%\n"
-        f"Total P&amp;L: {'+' if cum_pnl >= 0 else ''}{round(cum_pnl, 2)}%"
-    )
-
-def fmt_final_summary(all_trades):
-    wins   = sum(1 for t in all_trades if t["result"] == "WIN")
-    losses = len(all_trades) - wins
-    total  = len(all_trades)
-    wr     = round(wins / total * 100) if total > 0 else 0
-    avg_win  = round(sum(t["pnl_pct"] for t in all_trades if t["result"] == "WIN")  / max(wins, 1),  2)
-    avg_loss = round(sum(t["pnl_pct"] for t in all_trades if t["result"] == "LOSS") / max(losses, 1), 2)
-    total_pnl= round(sum(t["pnl_pct"] for t in all_trades), 2)
-    rr       = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else "∞"
-
-    return (
-        f"🏁 <b>[BACKTEST] FINAL REPORT — 30 Days</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Total Signals : {total}\n"
-        f"Wins          : {wins}  ({wr}%)\n"
-        f"Losses        : {losses}\n"
-        f"Total P&amp;L      : {'+' if total_pnl >= 0 else ''}{total_pnl}%\n"
-        f"Avg Win       : +{avg_win}%\n"
-        f"Avg Loss      : {avg_loss}%\n"
-        f"Actual R:R    : 1 : {rr}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{'✅ Strategy TARGET MET (≥70%)' if wr >= 70 else '⚠️ Below 70% — review filters'}"
-    )
-
-# ══════════════════════════════════════════════
-# MAIN BACKTEST ENGINE
-# ══════════════════════════════════════════════
+# =====================================================
+# BACKTEST ENGINE
+# =====================================================
 def run_backtest():
-    init_db()
+    global API_OBJECT
+    API_OBJECT = login()
+    if not API_OBJECT: return
 
-    if not login():
-        print("[backtest] Login failed. Exiting.")
-        return
-
-    send(
-        f"🔁 <b>[BACKTEST STARTED]</b>\n"
-        f"Period  : Last {BACKTEST_DAYS} calendar days\n"
-        f"Replay  : Every {REPLAY_STEP_MIN} min per day\n"
-        f"Filters : EMA {EMA_FAST}/{EMA_SLOW} + RSI + Vol ×{VOLUME_SPIKE}\n"
-        f"SL/TGT  : ATR×{SL_MULT} / ATR×{TGT_MULT}\n"
-        f"Watch Telegram for daily results..."
-    )
-
-    # Build list of trading days
-    today       = datetime.now(IST).date()
-    start_date  = today - timedelta(days=BACKTEST_DAYS)
+    # 1. Determine the last N trading days
     trading_days = []
-    d = start_date
-    while d < today:
-        if d.weekday() < 5 and d not in NSE_HOLIDAYS:
-            trading_days.append(d)
-        d += timedelta(days=1)
+    current_date = datetime.now(IST).date() - timedelta(days=1)
+    
+    while len(trading_days) < BACKTEST_DAYS:
+        if current_date.weekday() < 5: # Monday to Friday
+            trading_days.append(current_date)
+        current_date -= timedelta(days=1)
+    
+    trading_days.reverse() # Chronological order
+    trade_log = []
 
-    print(f"[backtest] {len(trading_days)} trading days to process")
+    print(f"\nStarting Backtest for the last {BACKTEST_DAYS} trading days.")
+    print("Warning: Fetching data takes time due to API rate limits (~1 min per day).")
 
-    all_trades = []
-
-    for trade_date in trading_days:
-        date_str   = trade_date.strftime("%Y-%m-%d")
-        day_trades = []
-        alerted    = set()   # symbols already alerted today
-
-        print(f"\n[backtest] ── {date_str} ──")
-        send(f"📅 <b>[BACKTEST]</b> Starting day: {date_str}")
-
-        # Fetch all candles for this day for every stock
-        day_cache = {}
+    for target_date in trading_days:
+        date_str = target_date.strftime("%Y-%m-%d")
+        print(f"\n--- Processing Date: {date_str} ---")
+        
+        # Pre-fetch all data for the day to simulate live market
+        day_data = {}
         for sector, stocks in SECTORS.items():
             for symbol, token in stocks.items():
-                df = fetch_day_candles(token, symbol, date_str)
-                time.sleep(CANDLE_DELAY)
+                df = fetch_historical_day(token, symbol, date_str)
                 if not df.empty:
-                    day_cache[(sector, symbol)] = df
+                    day_data[symbol] = {"df": df, "sector": sector}
+                time.sleep(CANDLE_DELAY) # Strict rate limiting
 
-        if not day_cache:
-            print(f"[backtest] No data for {date_str} — skipping")
+        if not day_data:
+            print(f"No data available for {date_str}. Skipping.")
             continue
 
-        # FIX: Explicitly localize scan_start and scan_end to match Pandas TZ-aware time data
-        scan_start = IST.localize(datetime.strptime(f"{date_str} 09:25", "%Y-%m-%d %H:%M"))
-        scan_end   = IST.localize(datetime.strptime(f"{date_str} 15:15", "%Y-%m-%d %H:%M"))
-        step       = timedelta(minutes=REPLAY_STEP_MIN)
-        current_ts = scan_start
+        # 2. Simulate time progressing from 09:25 to 15:25
+        scan_times = pd.date_range(f"{date_str} 09:25", f"{date_str} 15:25", freq="5min", tz=IST)
+        day_trade_executed = False
 
-        while current_ts <= scan_end:
-            ts_str     = current_ts.strftime("%H:%M")
-            sector_changes: dict = {}
+        for current_time in scan_times:
+            if day_trade_executed: break
 
-            # Collect sector averages at this timestamp
-            for (sector, symbol), df in day_cache.items():
-                df_slice = df[df["time"] <= pd.Timestamp(current_ts)]
-                if df_slice.empty or df_slice.iloc[0]["open"] == 0:
-                    continue
-                chg = ((df_slice.iloc[-1]["close"] - df_slice.iloc[0]["open"])
-                       / df_slice.iloc[0]["open"]) * 100
-                sector_changes.setdefault(sector, []).append(chg)
+            market_data = []
+            sector_raw  = {}
 
-            sector_avg = {s: sum(v)/len(v) for s, v in sector_changes.items()}
+            # Evaluate each stock at exactly 'current_time'
+            for symbol, info in day_data.items():
+                df = info["df"]
+                sector = info["sector"]
+                
+                # Filter data up to the current simulated minute
+                df_up_to_now = df[df["time"] <= current_time]
+                
+                if len(df_up_to_now) < 4: continue
+                
+                open_price = df_up_to_now.iloc[0]["open"]
+                latest_close = df_up_to_now.iloc[-1]["close"]
+                
+                if open_price == 0: continue
+                
+                change_pct = ((latest_close - open_price) / open_price) * 100
+                sector_raw.setdefault(sector, []).append(change_pct)
+                market_data.append({"symbol": symbol, "sector": sector, "change": change_pct, "ltp": latest_close})
 
-            for (sector, symbol), df in day_cache.items():
-                if symbol in alerted:
-                    continue
+            if not market_data: continue
 
-                df_slice = df[df["time"] <= pd.Timestamp(current_ts)]
-                if df_slice.empty:
-                    continue
+            # Apply Strategy Logic
+            sector_avg = {s: sum(v)/len(v) for s, v in sector_raw.items()}
+            
+            signals = [
+                s for s in market_data
+                if s["sector"] in sector_avg
+                and abs(s["change"]) >= 0.25
+                and abs(sector_avg[s["sector"]]) >= 0.20
+            ]
 
-                open_p = df_slice.iloc[0]["open"]
+            if signals:
+                signals.sort(key=lambda x: abs(x["change"]), reverse=True)
+                top_signal = signals[0]
+                
+                # Execute Trade
+                entry_time = current_time
+                entry_price = top_signal["ltp"]
+                direction = "BUY" if top_signal["change"] > 0 else "SHORT"
+                
+                # Calculate Exit Price (Assuming intraday EOD exit at 15:15)
+                full_df = day_data[top_signal["symbol"]]["df"]
+                exit_row = full_df[full_df["time"] <= pd.Timestamp(f"{date_str} 15:15", tz=IST)].iloc[-1]
+                exit_price = exit_row["close"]
+                
+                # Calculate PnL
+                if direction == "BUY":
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                else:
+                    pnl_pct = ((entry_price - exit_price) / entry_price) * 100
 
-                # Sector filter
-                if abs(sector_avg.get(sector, 0)) < SECTOR_THRESHOLD:
-                    continue
+                print(f"[{entry_time.strftime('%H:%M')}] SIGNAL FIRED: {direction} {top_signal['symbol']} at {entry_price:.2f}")
+                print(f"[{exit_row['time'].strftime('%H:%M')}] EXIT {top_signal['symbol']} at {exit_price:.2f} | PnL: {pnl_pct:.2f}%")
 
-                sig = check_signal(df_slice, symbol, sector, open_p)
-                if sig is None:
-                    continue
+                trade_log.append({
+                    "Date": date_str,
+                    "Entry Time": entry_time.strftime('%H:%M'),
+                    "Symbol": top_signal["symbol"],
+                    "Direction": direction,
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "PnL %": round(pnl_pct, 2)
+                })
+                
+                day_trade_executed = True # Only 1 trade per day, as per original script
 
-                # Signal fired — find its candle index in full df
-                sig_idx = len(df[df["time"] <= pd.Timestamp(current_ts)]) - 1
+        if not day_trade_executed:
+            print("No signal generated for this day.")
 
-                # Simulate exit on remaining candles
-                result, exit_p, exit_ts = simulate_exit(
-                    df, sig_idx, sig["direction"], sig["sl"], sig["target"]
-                )
+    # 3. Print Final Results
+    print("\n=========================================")
+    print("           BACKTEST RESULTS              ")
+    print("=========================================")
+    if trade_log:
+        results_df = pd.DataFrame(trade_log)
+        print(results_df.to_string(index=False))
+        
+        wins = len(results_df[results_df["PnL %"] > 0])
+        losses = len(results_df[results_df["PnL %"] <= 0])
+        total_pnl = results_df["PnL %"].sum()
+        
+        print("\n--- Summary ---")
+        print(f"Total Trades : {len(trade_log)}")
+        print(f"Wins         : {wins}")
+        print(f"Losses       : {losses}")
+        print(f"Win Rate     : {(wins/len(trade_log))*100:.2f}%")
+        print(f"Total PnL %  : {total_pnl:.2f}%")
+    else:
+        print("No trades were executed during the backtest period.")
 
-                entry   = sig["ltp"]
-                pnl_pct = round(
-                    ((exit_p - entry) / entry * 100) if sig["direction"] == "BUY"
-                    else ((entry - exit_p) / entry * 100), 2
-                )
-
-                trade = {
-                    "date":        date_str,
-                    "signal_time": ts_str,
-                    "symbol":      symbol,
-                    "sector":      sector,
-                    "direction":   sig["direction"],
-                    "entry":       entry,
-                    "recommended": sig["strike_rec"]["recommended"],
-                    "strike":      sig["strike_rec"]["strike_label"],
-                    "sl":          sig["sl"],
-                    "target":      sig["target"],
-                    "sl_pct":      sig["sl_pct"],
-                    "tgt_pct":     sig["tgt_pct"],
-                    "rsi":         sig["rsi"],
-                    "vol_ratio":   sig["vol_ratio"],
-                    "atr":         sig["atr"],
-                    "result":      result,
-                    "exit_price":  exit_p,
-                    "exit_time":   exit_ts,
-                    "pnl_pct":     pnl_pct,
-                }
-
-                save_trade(trade)
-                day_trades.append(trade)
-                all_trades.append(trade)
-                alerted.add(symbol)
-
-                # Send Telegram alert + result
-                send(fmt_signal(sig, date_str, ts_str))
-                time.sleep(1)
-                send(fmt_result(trade, pnl_pct))
-                time.sleep(0.5)
-
-                print(
-                    f"  [{ts_str}] {symbol} {sig['direction']} "
-                    f"entry={entry} → {result} exit={exit_p} pnl={pnl_pct}%"
-                )
-
-            current_ts += step
-
-        # End of day summary
-        send(fmt_day_summary(date_str, day_trades, all_trades))
-        time.sleep(2)
-
-    # Final report
-    send(fmt_final_summary(all_trades))
-
-    # Print DB summary
-    stats = get_summary()
-    print("\n[backtest] ══ COMPLETE ══")
-    for result, s in stats.items():
-        print(f"  {result}: {s['count']} trades, avg P&L: {s['avg_pnl']}%")
-
-# ══════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════
 if __name__ == "__main__":
     run_backtest()
