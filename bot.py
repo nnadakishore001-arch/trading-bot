@@ -1,3 +1,12 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║       BACKTEST BOT — CONFLUENCE SCORING, 1-MONTH REPLAY        ║
+║  Identical strategy to production_bot.py                       ║
+║  Sends real Telegram alerts with [BACKTEST] prefix             ║
+║  Max 2 trades/day replayed per historical day                  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
 import os
 import sqlite3
 import pandas as pd
@@ -194,7 +203,8 @@ def fetch_day(token, symbol, date_str):
             if resp and resp.get("data"):
                 df = pd.DataFrame(resp["data"],
                     columns=["time","open","high","low","close","volume"])
-                df["time"] = pd.to_datetime(df["time"])
+                # Parse timestamps then strip timezone → always tz-naive for comparison
+                df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
                 return df
             return pd.DataFrame()
         except Exception as e:
@@ -447,8 +457,8 @@ def run_backtest():
 
         # Replay time-steps 09:25 → 14:45 in REPLAY_STEP_MIN steps
         step     = timedelta(minutes=REPLAY_STEP_MIN)
-        cur_ts   = datetime.strptime(f"{date_str} 09:25", "%Y-%m-%d %H:%M")
-        end_ts   = datetime.strptime(f"{date_str} 14:45", "%Y-%m-%d %H:%M")
+        cur_ts   = pd.Timestamp(f"{date_str} 09:25")   # tz-naive, matches df["time"]
+        end_ts   = pd.Timestamp(f"{date_str} 14:45")
         day_count= 0
 
         while cur_ts <= end_ts and day_count < MAX_TRADES_PER_DAY:
