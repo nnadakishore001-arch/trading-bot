@@ -2,14 +2,14 @@ import os
 import pandas as pd
 import pyotp
 import requests
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 import pytz
 import time
 
-# =====================================================
-# ENV VARIABLES (Fill these in your environment)
-# =====================================================
+# ─────────────────────────────────────────────
+# CONFIGURATION & ENV
+# ─────────────────────────────────────────────
 API_KEY     = os.getenv("API_KEY")
 CLIENT_ID   = os.getenv("CLIENT_ID")
 PASSWORD    = os.getenv("PASSWORD")
@@ -17,25 +17,20 @@ TOTP_SECRET = os.getenv("TOTP_SECRET")
 TG_TOKEN    = os.getenv("TG_TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
 
-# =====================================================
-# BACKTEST CONFIGURATION
-# =====================================================
-DAYS_TO_BACKTEST = 30      # How many trading days to look back
+# BACKTEST SETTINGS
+BACKTEST_DAYS    = 30
+STOCK_MIN_MOVE   = 0.35    # Min % move from open
+STOCK_MAX_MOVE   = 1.80    # Max % move (Prevents buying at the absolute top)
+SECTOR_THRESHOLD = 0.25    # Stronger confirmation
+STOP_LOSS_PCT    = 0.70    # Hard SL to prevent big account losses
+TARGET_PCT       = 1.50    # Realistic Intraday Target
+CANDLE_DELAY     = 1.1     # Safe API delay
+
 IST = pytz.timezone("Asia/Kolkata")
 
-# Strategy Settings (Matches your Live Code)
-EMA_FAST = 9
-EMA_SLOW = 21
-VOLUME_SPIKE = 2.0
-STOCK_THRESHOLD = 0.25
-SECTOR_THRESHOLD = 0.20
-SL_PCT = 0.30
-TARGET_PCT = 0.60
-CANDLE_DELAY = 1.1
-
-# =====================================================
-# SECTOR MAP (Matches your Live Code)
-# =====================================================
+# ─────────────────────────────────────────────
+# SECTORS & SYMBOLS
+# ─────────────────────────────────────────────
 SECTORS = {
     "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
     "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
@@ -48,200 +43,156 @@ SECTORS = {
     "INFRA": {"LT":"11483","ADANIPORTS":"15083"},
 }
 
-API_OBJECT = None
-
-# =====================================================
-# TELEGRAM NOTIFICATION
-# =====================================================
-def send_bt_msg(msg):
+# ─────────────────────────────────────────────
+# CORE FUNCTIONS
+# ─────────────────────────────────────────────
+def send_telegram(msg):
+    """Sends monospaced formatted table to Telegram."""
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": f"<pre>{msg}</pre>",
+        "parse_mode": "HTML"
+    }
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": f"📊 [BACKTEST]\n{msg}"}
-        )
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print("Telegram Error:", e)
+        print(f"Telegram Error: {e}")
 
-# =====================================================
-# LOGIN & DATA FETCHING
-# =====================================================
 def login():
-    global API_OBJECT
-    obj = SmartConnect(api_key=API_KEY)
-    data = obj.generateSession(CLIENT_ID, PASSWORD, pyotp.TOTP(TOTP_SECRET).now())
-    if data.get("status"):
-        obj.generateToken(data["data"]["refreshToken"])
-        return obj
-    return None
-
-def fetch_historical_data(token, date_str):
-    """Fetches full day 5-min candles."""
     try:
-        res = API_OBJECT.getCandleData({
-            "exchange": "NSE",
-            "symboltoken": token,
-            "interval": "FIVE_MINUTE",
-            "fromdate": f"{date_str} 09:15",
-            "todate": f"{date_str} 15:30"
+        obj = SmartConnect(api_key=API_KEY)
+        totp = pyotp.TOTP(TOTP_SECRET).now()
+        data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+        if data.get("status"):
+            obj.generateToken(data["data"]["refreshToken"])
+            return obj
+    except: return None
+
+def fetch_data(token, date_str):
+    try:
+        res = API.getCandleData({
+            "exchange": "NSE", "symboltoken": token, "interval": "FIVE_MINUTE",
+            "fromdate": f"{date_str} 09:15", "todate": f"{date_str} 15:30"
         })
         if res.get("data"):
             df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df["time"] = pd.to_datetime(df["time"]).dt.tz_convert("Asia/Kolkata")
             return df
-    except:
-        pass
+    except: pass
     return pd.DataFrame()
 
-# =====================================================
-# INDICATORS
-# =====================================================
-def compute_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+# ─────────────────────────────────────────────
+# START BACKTEST
+# ─────────────────────────────────────────────
+API = login()
+if not API:
+    print("Login Failed")
+    exit()
 
-def check_signal(df, sector_avg_move):
-    if len(df) < EMA_SLOW + 2: return None
+trading_days = []
+curr_date = datetime.now(IST).date()
+while len(trading_days) < BACKTEST_DAYS:
+    curr_date -= timedelta(days=1)
+    if curr_date.weekday() < 5: trading_days.append(curr_date.strftime("%Y-%m-%d"))
+
+all_trades = []
+print(f"Starting Sniper Backtest for {BACKTEST_DAYS} days...")
+
+for date_str in reversed(trading_days):
+    day_cache = {}
+    print(f"Processing: {date_str}")
     
-    ema9 = compute_ema(df["close"], EMA_FAST)
-    ema21 = compute_ema(df["close"], EMA_SLOW)
+    for sec, stocks in SECTORS.items():
+        for sym, token in stocks.items():
+            df = fetch_data(token, date_str)
+            if not df.empty: day_cache[sym] = {"df": df, "sector": sec}
+            time.sleep(CANDLE_DELAY)
+
+    # Replay logic at exactly 09:45
+    current_time = pd.Timestamp(f"{date_str} 09:45", tz="Asia/Kolkata")
+    sector_moves = {}
     
-    # Crossover logic
-    crossover = None
-    if ema9.iloc[-2] <= ema21.iloc[-2] and ema9.iloc[-1] > ema21.iloc[-1]: crossover = "BUY"
-    if ema9.iloc[-2] >= ema21.iloc[-2] and ema9.iloc[-1] < ema21.iloc[-1]: crossover = "SHORT"
+    for sym, data in day_cache.items():
+        df_slice = data["df"][data["df"]["time"] <= current_time]
+        if not df_slice.empty:
+            move = ((df_slice.iloc[-1]["close"] - df_slice.iloc[0]["open"]) / df_slice.iloc[0]["open"]) * 100
+            sector_moves.setdefault(data["sector"], []).append(move)
     
-    if not crossover: return None
+    sector_avgs = {sec: sum(m)/len(m) for sec, m in sector_moves.items()}
 
-    # Volume & Reversal logic
-    avg_vol = df["volume"].iloc[:-1].mean()
-    vol_spike = df["volume"].iloc[-1] >= VOLUME_SPIKE * avg_vol
-    
-    candle = df.iloc[-1]
-    body = abs(candle["close"] - candle["open"])
-    rng = (candle["high"] - candle["low"])
-    no_reversal = (body / rng) >= 0.30 if rng != 0 else False
-
-    # Threshold checks
-    open_price = df.iloc[0]["open"]
-    move = ((candle["close"] - open_price) / open_price) * 100
-    
-    if abs(move) >= STOCK_THRESHOLD and abs(sector_avg_move) >= SECTOR_THRESHOLD and vol_spike and no_reversal:
-        return crossover
-    return None
-
-# =====================================================
-# MAIN BACKTEST ENGINE
-# =====================================================
-def run_backtest():
-    global API_OBJECT
-    API_OBJECT = login()
-    if not API_OBJECT: 
-        print("Login Failed")
-        return
-
-    # Determine trading days
-    backtest_days = []
-    curr = datetime.now(IST).date()
-    while len(backtest_days) < DAYS_TO_BACKTEST:
-        curr -= timedelta(days=1)
-        if curr.weekday() < 5: backtest_days.append(curr)
-    
-    backtest_days.sort()
-    all_trades = []
-
-    send_bt_msg(f"Starting Backtest for last {DAYS_TO_BACKTEST} days...")
-
-    for day in backtest_days:
-        date_str = day.strftime("%Y-%m-%d")
-        print(f"Processing {date_str}...")
+    # Scan for Signal
+    day_signal_found = False
+    for sym, data in day_cache.items():
+        if day_signal_found: break
         
-        # 1. Fetch data for all stocks for this day
-        day_cache = {}
-        for sector, stocks in SECTORS.items():
-            for symbol, token in stocks.items():
-                df = fetch_historical_data(token, date_str)
-                if not df.empty:
-                    day_cache[symbol] = {"df": df, "sector": sector}
-                time.sleep(CANDLE_DELAY)
+        df_slice = data["df"][data["df"]["time"] <= current_time]
+        if df_slice.empty: continue
+        
+        open_p = df_slice.iloc[0]["open"]
+        ltp = df_slice.iloc[-1]["close"]
+        move = ((ltp - open_p) / open_p) * 100
+        sec_move = sector_avgs.get(data["sector"], 0)
 
-        # 2. Simulate the day (09:25 to 15:25)
-        # We step 5 minutes at a time
-        time_steps = pd.date_range(f"{date_str} 09:25", f"{date_str} 15:25", freq="5min", tz="Asia/Kolkata")
-        
-        day_trades_count = 0
-        
-        for current_time in time_steps:
-            # Calculate sector averages for this specific time step
-            sector_moves = {}
-            for sym, data in day_cache.items():
-                df_slice = data["df"][data["df"]["time"] <= current_time]
-                if not df_slice.empty:
-                    move = ((df_slice.iloc[-1]["close"] - df_slice.iloc[0]["open"]) / df_slice.iloc[0]["open"]) * 100
-                    sector_moves.setdefault(data["sector"], []).append(move)
+        # Filters
+        if abs(move) >= STOCK_MIN_MOVE and abs(move) <= STOCK_MAX_MOVE and abs(sec_move) >= SECTOR_THRESHOLD:
+            direction = "BUY" if move > 0 else "SHORT"
+            sl = ltp * (1 - STOP_LOSS_PCT/100) if direction == "BUY" else ltp * (1 + STOP_LOSS_PCT/100)
+            tgt = ltp * (1 + TARGET_PCT/100) if direction == "BUY" else ltp * (1 - TARGET_PCT/100)
             
-            sector_avgs = {sec: sum(m)/len(m) for sec, m in sector_moves.items()}
+            # Walk forward to find exit
+            future = data["df"][data["df"]["time"] > current_time]
+            exit_p = ltp
+            for _, row in future.iterrows():
+                if direction == "BUY":
+                    if row["low"] <= sl: exit_p = sl; break
+                    if row["high"] >= tgt: exit_p = tgt; break
+                else:
+                    if row["high"] >= sl: exit_p = sl; break
+                    if row["low"] <= tgt: exit_p = tgt; break
+                exit_p = row["close"] # EOD Exit
 
-            # Check signals for each stock
-            for sym, data in day_cache.items():
-                df_slice = data["df"][data["df"]["time"] <= current_time]
-                signal = check_signal(df_slice, sector_avgs.get(data["sector"], 0))
-                
-                if signal:
-                    # SIMULATE TRADE
-                    entry_price = df_slice.iloc[-1]["close"]
-                    entry_time = current_time.strftime("%H:%M")
-                    
-                    sl = entry_price * (1 - SL_PCT/100) if signal == "BUY" else entry_price * (1 + SL_PCT/100)
-                    tgt = entry_price * (1 + TARGET_PCT/100) if signal == "BUY" else entry_price * (1 - TARGET_PCT/100)
-                    
-                    # Track outcome in future candles
-                    future_df = data["df"][data["df"]["time"] > current_time]
-                    outcome = "EOD"
-                    exit_price = entry_price
-                    exit_time = "15:25"
+            pnl = ((exit_p - ltp) / ltp * 100) if direction == "BUY" else ((ltp - exit_p) / ltp * 100)
+            
+            all_trades.append({
+                "Date": date_str, "Time": "09:45", "Symbol": sym, 
+                "Dir": direction, "Entry": round(ltp, 2), "Exit": round(exit_p, 2), 
+                "PnL": round(pnl, 2)
+            })
+            day_signal_found = True
 
-                    for _, row in future_df.iterrows():
-                        if signal == "BUY":
-                            if row["low"] <= sl: outcome = "SL"; exit_price = sl; exit_time = row["time"].strftime("%H:%M"); break
-                            if row["high"] >= tgt: outcome = "TARGET"; exit_price = tgt; exit_time = row["time"].strftime("%H:%M"); break
-                        else:
-                            if row["high"] >= sl: outcome = "SL"; exit_price = sl; exit_time = row["time"].strftime("%H:%M"); break
-                            if row["low"] <= tgt: outcome = "TARGET"; exit_price = tgt; exit_time = row["time"].strftime("%H:%M"); break
-                        exit_price = row["close"]
-
-                    pnl = ((exit_price - entry_price) / entry_price) * 100 if signal == "BUY" else ((entry_price - exit_price) / entry_price) * 100
-                    
-                    trade_info = {
-                        "day": date_str, "sym": sym, "dir": signal, "entry": entry_price, 
-                        "time": entry_time, "outcome": outcome, "pnl": pnl, "exit_t": exit_time
-                    }
-                    
-                    all_trades.append(trade_info)
-                    
-                    # Notify Telegram
-                    send_bt_msg(
-                        f"📅 Date: {date_str}\n"
-                        f"🔔 Signal: {signal} {sym}\n"
-                        f"🕒 Entry: {entry_time} @ ₹{round(entry_price, 2)}\n"
-                        f"🏁 Result: {outcome} at {exit_time}\n"
-                        f"💰 P&L: {round(pnl, 2)}%"
-                    )
-                    day_trades_count += 1
-                    # Note: We simulate as if the bot keeps scanning, but you can add a 'break' 
-                    # if your live bot only takes 1 trade per stock per day.
-
-    # Final Summary
-    if all_trades:
-        total_pnl = sum([t['pnl'] for t in all_trades])
-        wins = len([t for t in all_trades if t['pnl'] > 0])
-        summary = (
-            f"🏁 BACKTEST COMPLETE 🏁\n"
-            f"Total Trades: {len(all_trades)}\n"
-            f"Win Rate: {round((wins/len(all_trades))*100, 2)}%\n"
-            f"Total P&L: {round(total_pnl, 2)}%"
-        )
-        send_bt_msg(summary)
-    else:
-        send_bt_msg("Backtest finished: No signals found in this period.")
-
-if __name__ == "__main__":
-    run_backtest()
+# ─────────────────────────────────────────────
+# FORMAT FINAL REPORT
+# ─────────────────────────────────────────────
+if all_trades:
+    df_res = pd.DataFrame(all_trades)
+    
+    # Calculate Stats
+    total = len(df_res)
+    wins = len(df_res[df_res["PnL"] > 0])
+    losses = total - wins
+    win_rate = round((wins / total) * 100, 2)
+    total_pnl = round(df_res["PnL"].sum(), 2)
+    
+    # Format Table Header
+    report = "            BACKTEST RESULTS              \n"
+    report += "=========================================\n"
+    report += "      Date Entry Time      Symbol Direction  Entry Price  Exit Price  PnL %\n"
+    
+    # Add Rows
+    for _, r in df_res.iterrows():
+        report += f"{r['Date']}      {r['Time']}  {r['Symbol']:>10}  {r['Dir']:>5}  {r['Entry']:>11}  {r['Exit']:>10}  {r['PnL']:>5}\n"
+    
+    # Add Summary
+    report += f"\n--- Summary ---\n"
+    report += f"Total Trades : {total}\n"
+    report += f"Wins         : {wins}\n"
+    report += f"Losses       : {losses}\n"
+    report += f"Win Rate     : {win_rate}%\n"
+    report += f"Total PnL %  : {total_pnl}%"
+    
+    # Final Send
+    print(report)
+    send_telegram(report)
+else:
+    print("No trades found in backtest.")
