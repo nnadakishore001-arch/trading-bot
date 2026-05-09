@@ -2,237 +2,246 @@ import os
 import pandas as pd
 import pyotp
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from SmartApi import SmartConnect
 import pytz
 import time
 
 # =====================================================
-# ENV VARIABLES
+# ENV VARIABLES (Fill these in your environment)
 # =====================================================
 API_KEY     = os.getenv("API_KEY")
 CLIENT_ID   = os.getenv("CLIENT_ID")
 PASSWORD    = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
+TG_TOKEN    = os.getenv("TG_TOKEN")
+CHAT_ID     = os.getenv("CHAT_ID")
 
 # =====================================================
 # BACKTEST CONFIGURATION
 # =====================================================
-BACKTEST_DAYS = 30      # Number of previous trading days to test
-CANDLE_DELAY  = 1.1     # Essential delay to prevent Angel One 403 blocks
-MAX_RETRIES   = 3
-RETRY_BACKOFF = 2.0
+DAYS_TO_BACKTEST = 30      # How many trading days to look back
+IST = pytz.timezone("Asia/Kolkata")
 
-API_OBJECT = None
-IST        = pytz.timezone("Asia/Kolkata")
+# Strategy Settings (Matches your Live Code)
+EMA_FAST = 9
+EMA_SLOW = 21
+VOLUME_SPIKE = 2.0
+STOCK_THRESHOLD = 0.25
+SECTOR_THRESHOLD = 0.20
+SL_PCT = 0.30
+TARGET_PCT = 0.60
+CANDLE_DELAY = 1.1
 
 # =====================================================
-# SECTORS (Same as Live)
+# SECTOR MAP (Matches your Live Code)
 # =====================================================
 SECTORS = {
-    "BANK": {"HDFCBANK":"1333", "ICICIBANK":"4963", "SBIN":"3045", "AXISBANK":"5900", "KOTAKBANK":"1922"},
-    "IT": {"TCS":"11536", "INFY":"1594", "HCLTECH":"7229", "TECHM":"13538", "WIPRO":"3787"},
-    "AUTO": {"TATAMOTORS":"3456", "MARUTI":"10999", "M&M":"2031", "BAJAJ-AUTO":"16669"},
-    "PHARMA": {"SUNPHARMA":"3351", "CIPLA":"694", "DRREDDY":"881", "DIVISLAB":"10940"},
-    "FMCG": {"ITC":"1660", "HINDUNILVR":"1394", "NESTLEIND":"17963"},
-    "METAL": {"TATASTEEL":"3499", "JSWSTEEL":"11723", "HINDALCO":"1363"},
-    "ENERGY": {"RELIANCE":"2885", "ONGC":"2475", "NTPC":"11630", "POWERGRID":"14977"},
-    "NBFC": {"BAJFINANCE":"317", "BAJAJFINSV":"16675"},
-    "INFRA": {"LT":"11483", "ADANIPORTS":"15083"},
+    "BANK": {"HDFCBANK":"1333","ICICIBANK":"4963","SBIN":"3045","AXISBANK":"5900","KOTAKBANK":"1922"},
+    "IT": {"TCS":"11536","INFY":"1594","HCLTECH":"7229","TECHM":"13538","WIPRO":"3787"},
+    "AUTO": {"TATAMOTORS":"3456","MARUTI":"10999","M&M":"2031","BAJAJ-AUTO":"16669"},
+    "PHARMA": {"SUNPHARMA":"3351","CIPLA":"694","DRREDDY":"881","DIVISLAB":"10940"},
+    "FMCG": {"ITC":"1660","HINDUNILVR":"1394","NESTLEIND":"17963"},
+    "METAL": {"TATASTEEL":"3499","JSWSTEEL":"11723","HINDALCO":"1363"},
+    "ENERGY": {"RELIANCE":"2885","ONGC":"2475","NTPC":"11630","POWERGRID":"14977"},
+    "NBFC": {"BAJFINANCE":"317","BAJAJFINSV":"16675"},
+    "INFRA": {"LT":"11483","ADANIPORTS":"15083"},
 }
 
+API_OBJECT = None
+
 # =====================================================
-# LOGIN
+# TELEGRAM NOTIFICATION
+# =====================================================
+def send_bt_msg(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": f"📊 [BACKTEST]\n{msg}"}
+        )
+    except Exception as e:
+        print("Telegram Error:", e)
+
+# =====================================================
+# LOGIN & DATA FETCHING
 # =====================================================
 def login():
-    print("Logging into Angel One SmartAPI...")
-    try:
-        obj  = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-        if not data or data.get("status") is False:
-            print("Login failed.")
-            return None
-            
-        rf = data["data"]["refreshToken"]
-        obj.getfeedToken()
-        obj.getProfile(rf)
-        obj.generateToken(rf)
-        print("Login Successful!")
-        return obj
-    except Exception as e:
-        print(f"Login error: {e}")
-        return None
-
-# =====================================================
-# DATA FETCHING
-# =====================================================
-def fetch_historical_day(token, symbol, date_str):
-    """Fetches a full single day of 5-min candles."""
     global API_OBJECT
-    from_str = f"{date_str} 09:15"
-    to_str   = f"{date_str} 15:30"
+    obj = SmartConnect(api_key=API_KEY)
+    data = obj.generateSession(CLIENT_ID, PASSWORD, pyotp.TOTP(TOTP_SECRET).now())
+    if data.get("status"):
+        obj.generateToken(data["data"]["refreshToken"])
+        return obj
+    return None
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = API_OBJECT.getCandleData({
-                "exchange": "NSE", "symboltoken": token,
-                "interval": "FIVE_MINUTE", "fromdate": from_str, "todate": to_str
-            })
-            
-            if resp and resp.get("data"):
-                df = pd.DataFrame(resp["data"], columns=["time", "open", "high", "low", "close", "volume"])
-                df["time"] = pd.to_datetime(df["time"])
-                return df
-            return pd.DataFrame()
-            
-        except Exception as e:
-            msg = str(e).lower()
-            if "exceeding access rate" in msg or "access denied" in msg:
-                time.sleep(RETRY_BACKOFF * attempt)
-            else:
-                return pd.DataFrame()
+def fetch_historical_data(token, date_str):
+    """Fetches full day 5-min candles."""
+    try:
+        res = API_OBJECT.getCandleData({
+            "exchange": "NSE",
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": f"{date_str} 09:15",
+            "todate": f"{date_str} 15:30"
+        })
+        if res.get("data"):
+            df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+            df["time"] = pd.to_datetime(df["time"]).dt.tz_convert("Asia/Kolkata")
+            return df
+    except:
+        pass
     return pd.DataFrame()
 
 # =====================================================
-# BACKTEST ENGINE
+# INDICATORS
+# =====================================================
+def compute_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def check_signal(df, sector_avg_move):
+    if len(df) < EMA_SLOW + 2: return None
+    
+    ema9 = compute_ema(df["close"], EMA_FAST)
+    ema21 = compute_ema(df["close"], EMA_SLOW)
+    
+    # Crossover logic
+    crossover = None
+    if ema9.iloc[-2] <= ema21.iloc[-2] and ema9.iloc[-1] > ema21.iloc[-1]: crossover = "BUY"
+    if ema9.iloc[-2] >= ema21.iloc[-2] and ema9.iloc[-1] < ema21.iloc[-1]: crossover = "SHORT"
+    
+    if not crossover: return None
+
+    # Volume & Reversal logic
+    avg_vol = df["volume"].iloc[:-1].mean()
+    vol_spike = df["volume"].iloc[-1] >= VOLUME_SPIKE * avg_vol
+    
+    candle = df.iloc[-1]
+    body = abs(candle["close"] - candle["open"])
+    rng = (candle["high"] - candle["low"])
+    no_reversal = (body / rng) >= 0.30 if rng != 0 else False
+
+    # Threshold checks
+    open_price = df.iloc[0]["open"]
+    move = ((candle["close"] - open_price) / open_price) * 100
+    
+    if abs(move) >= STOCK_THRESHOLD and abs(sector_avg_move) >= SECTOR_THRESHOLD and vol_spike and no_reversal:
+        return crossover
+    return None
+
+# =====================================================
+# MAIN BACKTEST ENGINE
 # =====================================================
 def run_backtest():
     global API_OBJECT
     API_OBJECT = login()
-    if not API_OBJECT: return
+    if not API_OBJECT: 
+        print("Login Failed")
+        return
 
-    # 1. Determine the last N trading days
-    trading_days = []
-    current_date = datetime.now(IST).date() - timedelta(days=1)
+    # Determine trading days
+    backtest_days = []
+    curr = datetime.now(IST).date()
+    while len(backtest_days) < DAYS_TO_BACKTEST:
+        curr -= timedelta(days=1)
+        if curr.weekday() < 5: backtest_days.append(curr)
     
-    while len(trading_days) < BACKTEST_DAYS:
-        if current_date.weekday() < 5: # Monday to Friday
-            trading_days.append(current_date)
-        current_date -= timedelta(days=1)
-    
-    trading_days.reverse() # Chronological order
-    trade_log = []
+    backtest_days.sort()
+    all_trades = []
 
-    print(f"\nStarting Backtest for the last {BACKTEST_DAYS} trading days.")
-    print("Warning: Fetching data takes time due to API rate limits (~1 min per day).")
+    send_bt_msg(f"Starting Backtest for last {DAYS_TO_BACKTEST} days...")
 
-    for target_date in trading_days:
-        date_str = target_date.strftime("%Y-%m-%d")
-        print(f"\n--- Processing Date: {date_str} ---")
+    for day in backtest_days:
+        date_str = day.strftime("%Y-%m-%d")
+        print(f"Processing {date_str}...")
         
-        # Pre-fetch all data for the day to simulate live market
-        day_data = {}
+        # 1. Fetch data for all stocks for this day
+        day_cache = {}
         for sector, stocks in SECTORS.items():
             for symbol, token in stocks.items():
-                df = fetch_historical_day(token, symbol, date_str)
+                df = fetch_historical_data(token, date_str)
                 if not df.empty:
-                    day_data[symbol] = {"df": df, "sector": sector}
-                time.sleep(CANDLE_DELAY) # Strict rate limiting
+                    day_cache[symbol] = {"df": df, "sector": sector}
+                time.sleep(CANDLE_DELAY)
 
-        if not day_data:
-            print(f"No data available for {date_str}. Skipping.")
-            continue
-
-        # 2. Simulate time progressing from 09:25 to 15:25
-        scan_times = pd.date_range(f"{date_str} 09:25", f"{date_str} 15:25", freq="5min", tz=IST)
-        day_trade_executed = False
-
-        for current_time in scan_times:
-            if day_trade_executed: break
-
-            market_data = []
-            sector_raw  = {}
-
-            # Evaluate each stock at exactly 'current_time'
-            for symbol, info in day_data.items():
-                df = info["df"]
-                sector = info["sector"]
-                
-                # Filter data up to the current simulated minute
-                df_up_to_now = df[df["time"] <= current_time]
-                
-                if len(df_up_to_now) < 4: continue
-                
-                open_price = df_up_to_now.iloc[0]["open"]
-                latest_close = df_up_to_now.iloc[-1]["close"]
-                
-                if open_price == 0: continue
-                
-                change_pct = ((latest_close - open_price) / open_price) * 100
-                sector_raw.setdefault(sector, []).append(change_pct)
-                market_data.append({"symbol": symbol, "sector": sector, "change": change_pct, "ltp": latest_close})
-
-            if not market_data: continue
-
-            # Apply Strategy Logic
-            sector_avg = {s: sum(v)/len(v) for s, v in sector_raw.items()}
+        # 2. Simulate the day (09:25 to 15:25)
+        # We step 5 minutes at a time
+        time_steps = pd.date_range(f"{date_str} 09:25", f"{date_str} 15:25", freq="5min", tz="Asia/Kolkata")
+        
+        day_trades_count = 0
+        
+        for current_time in time_steps:
+            # Calculate sector averages for this specific time step
+            sector_moves = {}
+            for sym, data in day_cache.items():
+                df_slice = data["df"][data["df"]["time"] <= current_time]
+                if not df_slice.empty:
+                    move = ((df_slice.iloc[-1]["close"] - df_slice.iloc[0]["open"]) / df_slice.iloc[0]["open"]) * 100
+                    sector_moves.setdefault(data["sector"], []).append(move)
             
-            signals = [
-                s for s in market_data
-                if s["sector"] in sector_avg
-                and abs(s["change"]) >= 0.25
-                and abs(sector_avg[s["sector"]]) >= 0.20
-            ]
+            sector_avgs = {sec: sum(m)/len(m) for sec, m in sector_moves.items()}
 
-            if signals:
-                signals.sort(key=lambda x: abs(x["change"]), reverse=True)
-                top_signal = signals[0]
+            # Check signals for each stock
+            for sym, data in day_cache.items():
+                df_slice = data["df"][data["df"]["time"] <= current_time]
+                signal = check_signal(df_slice, sector_avgs.get(data["sector"], 0))
                 
-                # Execute Trade
-                entry_time = current_time
-                entry_price = top_signal["ltp"]
-                direction = "BUY" if top_signal["change"] > 0 else "SHORT"
-                
-                # Calculate Exit Price (Assuming intraday EOD exit at 15:15)
-                full_df = day_data[top_signal["symbol"]]["df"]
-                exit_row = full_df[full_df["time"] <= pd.Timestamp(f"{date_str} 15:15", tz=IST)].iloc[-1]
-                exit_price = exit_row["close"]
-                
-                # Calculate PnL
-                if direction == "BUY":
-                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                else:
-                    pnl_pct = ((entry_price - exit_price) / entry_price) * 100
+                if signal:
+                    # SIMULATE TRADE
+                    entry_price = df_slice.iloc[-1]["close"]
+                    entry_time = current_time.strftime("%H:%M")
+                    
+                    sl = entry_price * (1 - SL_PCT/100) if signal == "BUY" else entry_price * (1 + SL_PCT/100)
+                    tgt = entry_price * (1 + TARGET_PCT/100) if signal == "BUY" else entry_price * (1 - TARGET_PCT/100)
+                    
+                    # Track outcome in future candles
+                    future_df = data["df"][data["df"]["time"] > current_time]
+                    outcome = "EOD"
+                    exit_price = entry_price
+                    exit_time = "15:25"
 
-                print(f"[{entry_time.strftime('%H:%M')}] SIGNAL FIRED: {direction} {top_signal['symbol']} at {entry_price:.2f}")
-                print(f"[{exit_row['time'].strftime('%H:%M')}] EXIT {top_signal['symbol']} at {exit_price:.2f} | PnL: {pnl_pct:.2f}%")
+                    for _, row in future_df.iterrows():
+                        if signal == "BUY":
+                            if row["low"] <= sl: outcome = "SL"; exit_price = sl; exit_time = row["time"].strftime("%H:%M"); break
+                            if row["high"] >= tgt: outcome = "TARGET"; exit_price = tgt; exit_time = row["time"].strftime("%H:%M"); break
+                        else:
+                            if row["high"] >= sl: outcome = "SL"; exit_price = sl; exit_time = row["time"].strftime("%H:%M"); break
+                            if row["low"] <= tgt: outcome = "TARGET"; exit_price = tgt; exit_time = row["time"].strftime("%H:%M"); break
+                        exit_price = row["close"]
 
-                trade_log.append({
-                    "Date": date_str,
-                    "Entry Time": entry_time.strftime('%H:%M'),
-                    "Symbol": top_signal["symbol"],
-                    "Direction": direction,
-                    "Entry Price": entry_price,
-                    "Exit Price": exit_price,
-                    "PnL %": round(pnl_pct, 2)
-                })
-                
-                day_trade_executed = True # Only 1 trade per day, as per original script
+                    pnl = ((exit_price - entry_price) / entry_price) * 100 if signal == "BUY" else ((entry_price - exit_price) / entry_price) * 100
+                    
+                    trade_info = {
+                        "day": date_str, "sym": sym, "dir": signal, "entry": entry_price, 
+                        "time": entry_time, "outcome": outcome, "pnl": pnl, "exit_t": exit_time
+                    }
+                    
+                    all_trades.append(trade_info)
+                    
+                    # Notify Telegram
+                    send_bt_msg(
+                        f"📅 Date: {date_str}\n"
+                        f"🔔 Signal: {signal} {sym}\n"
+                        f"🕒 Entry: {entry_time} @ ₹{round(entry_price, 2)}\n"
+                        f"🏁 Result: {outcome} at {exit_time}\n"
+                        f"💰 P&L: {round(pnl, 2)}%"
+                    )
+                    day_trades_count += 1
+                    # Note: We simulate as if the bot keeps scanning, but you can add a 'break' 
+                    # if your live bot only takes 1 trade per stock per day.
 
-        if not day_trade_executed:
-            print("No signal generated for this day.")
-
-    # 3. Print Final Results
-    print("\n=========================================")
-    print("           BACKTEST RESULTS              ")
-    print("=========================================")
-    if trade_log:
-        results_df = pd.DataFrame(trade_log)
-        print(results_df.to_string(index=False))
-        
-        wins = len(results_df[results_df["PnL %"] > 0])
-        losses = len(results_df[results_df["PnL %"] <= 0])
-        total_pnl = results_df["PnL %"].sum()
-        
-        print("\n--- Summary ---")
-        print(f"Total Trades : {len(trade_log)}")
-        print(f"Wins         : {wins}")
-        print(f"Losses       : {losses}")
-        print(f"Win Rate     : {(wins/len(trade_log))*100:.2f}%")
-        print(f"Total PnL %  : {total_pnl:.2f}%")
+    # Final Summary
+    if all_trades:
+        total_pnl = sum([t['pnl'] for t in all_trades])
+        wins = len([t for t in all_trades if t['pnl'] > 0])
+        summary = (
+            f"🏁 BACKTEST COMPLETE 🏁\n"
+            f"Total Trades: {len(all_trades)}\n"
+            f"Win Rate: {round((wins/len(all_trades))*100, 2)}%\n"
+            f"Total P&L: {round(total_pnl, 2)}%"
+        )
+        send_bt_msg(summary)
     else:
-        print("No trades were executed during the backtest period.")
+        send_bt_msg("Backtest finished: No signals found in this period.")
 
 if __name__ == "__main__":
     run_backtest()
