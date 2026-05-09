@@ -20,10 +20,11 @@ CHAT_ID     = os.getenv("CHAT_ID")
 # BACKTEST SETTINGS
 BACKTEST_DAYS    = 30
 MAX_TRADES_DAILY = 2       
-STOCK_MIN_MOVE   = 0.40    
-STOCK_MAX_MOVE   = 2.00    
+STOCK_MIN_MOVE   = 0.45    
+STOCK_MAX_MOVE   = 1.90    
 SECTOR_THRESHOLD = 0.25    
 STOP_LOSS_PCT    = 0.70    
+BE_TRIGGER_PCT   = 0.70    # Move SL to Entry when price hits this % profit
 TARGET_PCT       = 1.50    
 CANDLE_DELAY     = 1.1     
 
@@ -48,6 +49,7 @@ SECTORS = {
 # CORE HELPERS
 # ─────────────────────────────────────────────
 def send_telegram(msg):
+    """Sends monospaced formatted table to Telegram."""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": f"<pre>{msg}</pre>", "parse_mode": "HTML"}
     try: requests.post(url, data=payload, timeout=10)
@@ -63,7 +65,7 @@ def login():
     except: return None
 
 def fetch_data(token, date_str):
-    """FIXED: Always returns a DataFrame to avoid AttributeError"""
+    """Ensures no NoneType error is returned."""
     try:
         res = API.getCandleData({"exchange": "NSE", "symboltoken": token, "interval": "FIVE_MINUTE",
                                  "fromdate": f"{date_str} 09:15", "todate": f"{date_str} 15:30"})
@@ -71,20 +73,17 @@ def fetch_data(token, date_str):
             df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df["time"] = pd.to_datetime(df["time"]).dt.tz_convert("Asia/Kolkata")
             return df
-    except Exception as e:
-        print(f"Fetch Error for {token}: {e}")
-    return pd.DataFrame() # Returns empty DF instead of None
+    except: pass
+    return pd.DataFrame()
 
 def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 # ─────────────────────────────────────────────
-# ENGINE
+# EXECUTION ENGINE
 # ─────────────────────────────────────────────
 API = login()
-if not API:
-    print("Login failed. Check credentials.")
-    exit()
+if not API: exit()
 
 trading_days = []
 curr_date = datetime.now(IST).date()
@@ -100,87 +99,101 @@ for date_str in reversed(trading_days):
     for sec, stocks in SECTORS.items():
         for sym, token in stocks.items():
             df = fetch_data(token, date_str)
-            if not df.empty: 
-                day_cache[sym] = {"df": df, "sector": sec}
+            if not df.empty: day_cache[sym] = {"df": df, "sector": sec}
             time.sleep(CANDLE_DELAY)
 
-    # Simulation Window
     time_steps = pd.date_range(f"{date_str} 09:25", f"{date_str} 15:15", freq="5min", tz="Asia/Kolkata")
     daily_trades = 0
-    active_symbols = set()
+    used_syms = set()
 
-    for current_ts in time_steps:
+    for ts in time_steps:
         if daily_trades >= MAX_TRADES_DAILY: break
         
-        # Sector moves at this timestamp
-        sector_moves = {}
+        # Sector moves at this minute
+        sec_moves = {}
         for sym, data in day_cache.items():
-            df_slice = data["df"][data["df"]["time"] <= current_ts]
-            if not df_slice.empty:
-                move = ((df_slice.iloc[-1]["close"] - df_slice.iloc[0]["open"]) / df_slice.iloc[0]["open"]) * 100
-                sector_moves.setdefault(data["sector"], []).append(move)
-        sec_avgs = {sec: sum(m)/len(m) for sec, m in sector_moves.items()}
+            df_s = data["df"][data["df"]["time"] <= ts]
+            if not df_s.empty:
+                m = ((df_s.iloc[-1]["close"] - df_s.iloc[0]["open"]) / df_s.iloc[0]["open"]) * 100
+                sec_moves.setdefault(data["sector"], []).append(m)
+        sec_avgs = {sec: sum(v)/len(v) for sec, v in sec_moves.items()}
 
         for sym, data in day_cache.items():
-            if daily_trades >= MAX_TRADES_DAILY: break
-            if sym in active_symbols: continue
+            if daily_trades >= MAX_TRADES_DAILY or sym in used_syms: continue
 
-            df_s = data["df"][data["df"]["time"] <= current_ts]
-            if len(df_s) < 22: continue 
+            df_s = data["df"][data["df"]["time"] <= ts]
+            if len(df_s) < 22: continue
 
-            ema9 = compute_ema(df_s["close"], 9)
-            ema21 = compute_ema(df_s["close"], 21)
-            
-            crossover = None
-            if ema9.iloc[-2] <= ema21.iloc[-2] and ema9.iloc[-1] > ema21.iloc[-1]: crossover = "BUY"
-            elif ema9.iloc[-2] >= ema21.iloc[-2] and ema9.iloc[-1] < ema21.iloc[-1]: crossover = "SHORT"
-
-            if not crossover: continue
+            e9, e21 = compute_ema(df_s["close"], 9), compute_ema(df_s["close"], 21)
+            side = None
+            if e9.iloc[-2] <= e21.iloc[-2] and e9.iloc[-1] > e21.iloc[-1]: side = "BUY"
+            elif e9.iloc[-2] >= e21.iloc[-2] and e9.iloc[-1] < e21.iloc[-1]: side = "SHORT"
+            if not side: continue
 
             ltp = df_s.iloc[-1]["close"]
             move = ((ltp - df_s.iloc[0]["open"]) / df_s.iloc[0]["open"]) * 100
-            sec_move = sec_avgs.get(data["sector"], 0)
             
-            # SunPharma Filter: Reversal check (Body > 30% of range)
+            # SunPharma Reversal Filter (Body Ratio > 0.35)
             candle = df_s.iloc[-1]
-            candle_range = (candle["high"] - candle["low"])
-            body_range_ratio = abs(candle["close"] - candle["open"]) / candle_range if candle_range != 0 else 0
+            c_rng = (candle["high"] - candle["low"])
+            body_ratio = abs(candle["close"] - candle["open"]) / c_rng if c_rng != 0 else 0
 
-            if abs(move) >= STOCK_MIN_MOVE and abs(move) <= STOCK_MAX_MOVE and abs(sec_move) >= SECTOR_THRESHOLD and body_range_ratio > 0.3:
-                # ENTRY FOUND
-                sl = ltp * (1 - STOP_LOSS_PCT/100) if crossover == "BUY" else ltp * (1 + STOP_LOSS_PCT/100)
-                tgt = ltp * (1 + TARGET_PCT/100) if crossover == "BUY" else ltp * (1 - TARGET_PCT/100)
+            if abs(move) >= STOCK_MIN_MOVE and abs(move) <= STOCK_MAX_MOVE and \
+               abs(sec_avgs.get(data["sector"], 0)) >= SECTOR_THRESHOLD and body_ratio > 0.35:
                 
-                # Exit Logic
-                future = data["df"][data["df"]["time"] > current_ts]
-                exit_p = ltp
-                for _, row in future.iterrows():
-                    if crossover == "BUY":
-                        if row["low"] <= sl: exit_p = sl; break
-                        if row["high"] >= tgt: exit_p = tgt; break
-                    else:
-                        if row["high"] >= sl: exit_p = sl; break
-                        if row["low"] <= tgt: exit_p = tgt; break
-                    exit_p = row["close"]
+                # ENTRY FOUND
+                entry = ltp
+                sl = entry * (1 - STOP_LOSS_PCT/100) if side == "BUY" else entry * (1 + STOP_LOSS_PCT/100)
+                be_trigger = entry * (1 + BE_TRIGGER_PCT/100) if side == "BUY" else entry * (1 - BE_TRIGGER_PCT/100)
+                tgt = entry * (1 + TARGET_PCT/100) if side == "BUY" else entry * (1 - TARGET_PCT/100)
+                
+                is_be_active = False
+                future = data["df"][data["df"]["time"] > ts]
+                final_exit = entry
 
-                pnl = ((exit_p - ltp) / ltp * 100) if crossover == "BUY" else ((ltp - exit_p) / ltp * 100)
-                all_trades.append({"Date": date_str, "Time": current_ts.strftime("%H:%M"), "Sym": sym, "Dir": crossover, "Entry": round(ltp,2), "Exit": round(exit_p,2), "PnL": round(pnl,2)})
-                daily_trades += 1
-                active_symbols.add(sym)
+                for _, row in future.iterrows():
+                    # Move SL to Entry if Break-Even Trigger hit
+                    if not is_be_active:
+                        if (side == "BUY" and row["high"] >= be_trigger) or (side == "SHORT" and row["low"] <= be_trigger):
+                            is_be_active = True
+                            sl = entry 
+
+                    # Check SL/TGT/EOD
+                    if side == "BUY":
+                        if row["low"] <= sl: final_exit = sl; break
+                        if row["high"] >= tgt: final_exit = tgt; break
+                    else:
+                        if row["high"] >= sl: final_exit = sl; break
+                        if row["low"] <= tgt: final_exit = tgt; break
+                    final_exit = row["close"]
+
+                pnl = ((final_exit - entry) / entry * 100) if side == "BUY" else ((entry - final_exit) / entry * 100)
+                all_trades.append({"Date": date_str, "Time": ts.strftime("%H:%M"), "Sym": sym, "Dir": side, "Entry": round(entry,2), "Exit": round(final_exit,2), "PnL": round(pnl,2)})
+                daily_trades += 1; used_syms.add(sym)
 
 # ─────────────────────────────────────────────
-# OUTPUT FORMATTING
+# FINAL FORMATTED OUTPUT
 # ─────────────────────────────────────────────
 if all_trades:
     res = pd.DataFrame(all_trades)
     wins = len(res[res["PnL"] > 0])
+    total = len(res)
+    
+    # Table Formatting
     summary = "            BACKTEST RESULTS              \n"
     summary += "=========================================\n"
     summary += "      Date Entry Time      Symbol Direction  Entry Price  Exit Price  PnL %\n"
     for _, r in res.iterrows():
-        summary += f"{r['Date']}      {r['Time']}  {r['Sym']:>10}  {r['Dir']:>9}  {r['Entry']:>11}  {r['Exit']:>10}  {r['PnL']:>5}\n"
-    summary += f"\n--- Summary ---\nTotal Trades : {len(res)}\nWins         : {wins}\nLosses       : {len(res)-wins}\nWin Rate     : {round(wins/len(res)*100,2)}%\nTotal PnL %  : {round(res['PnL'].sum(),2)}%"
+        summary += f"{r['Date']}      {r['Time']}  {r['Sym']:>10}  {r['Dir']:>9}  {r['Entry']:>11}  {r['Exit']:>10}  {r['PnL']:>5.2f}\n"
+    
+    summary += f"\n--- Summary ---\n"
+    summary += f"Total Trades : {total}\n"
+    summary += f"Wins         : {wins}\n"
+    summary += f"Losses       : {total - wins}\n"
+    summary += f"Win Rate     : {round(wins/total*100, 2)}%\n"
+    summary += f"Total PnL %  : {round(res['PnL'].sum(), 2)}%"
+    
     print(summary)
     send_telegram(summary)
 else:
-    print("No trades found.")
+    print("No signals found in the backtest period.")
