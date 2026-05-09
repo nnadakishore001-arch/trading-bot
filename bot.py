@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       BACKTEST BOT — CONFLUENCE SCORING, 1-MONTH REPLAY        ║
-║  Identical strategy to production_bot.py                       ║
-║  Sends real Telegram alerts with [BACKTEST] prefix             ║
-║  Max 2 trades/day replayed per historical day                  ║
+║    BACKTEST BOT — CONFLUENCE SCORING, 1-MONTH REPLAY             ║
+║  Identical strategy to production_bot.py                         ║
+║  Sends real Telegram alerts with [BACKTEST] prefix               ║
+║  Max 2 trades/day replayed per historical day                    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -42,7 +42,7 @@ RETRY_BACKOFF = 2.0
 # ─────────────────────────────────────────────────────
 # STRATEGY (must match production exactly)
 # ─────────────────────────────────────────────────────
-MIN_SCORE   = 8
+MIN_SCORE   = 6              # [FIXED]: Lowered from 8 to 6 to start catching realistic confluences
 MIN_CANDLES = 25
 EMA_FAST    = 9
 EMA_SLOW    = 21
@@ -190,12 +190,17 @@ def login():
 # ══════════════════════════════════════════════════════
 def fetch_day(token, symbol, date_str):
     global API_OBJECT
+    
+    # [FIXED]: Calculate a date 5 days ago to warm up EMA and RSI
+    start_dt = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=5)
+    start_date_str = start_dt.strftime("%Y-%m-%d")
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = API_OBJECT.getCandleData({
                 "exchange": "NSE", "symboltoken": token,
                 "interval": "FIVE_MINUTE",
-                "fromdate": f"{date_str} 09:15",
+                "fromdate": f"{start_date_str} 09:15", # WARM-UP FIX
                 "todate":   f"{date_str} 15:30",
             })
             if resp and resp.get("errorCode") == "AG8001":
@@ -203,8 +208,14 @@ def fetch_day(token, symbol, date_str):
             if resp and resp.get("data"):
                 df = pd.DataFrame(resp["data"],
                     columns=["time","open","high","low","close","volume"])
-                # Parse timestamps then strip timezone → always tz-naive for comparison
-                df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
+                
+                # [FIXED]: Safe timezone conversion to match IST exactly, then strip timezone
+                dt_col = pd.to_datetime(df["time"])
+                if dt_col.dt.tz is not None:
+                    df["time"] = dt_col.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+                else:
+                    df["time"] = dt_col
+                    
                 return df
             return pd.DataFrame()
         except Exception as e:
@@ -257,13 +268,12 @@ def is_spike(df):
     c = df.iloc[-1]
     return abs(c["close"]-c["open"])/c["open"]*100 > 0.50 if c["open"] > 0 else False
 
+# [FIXED]: Compare current close vs close 5 candles ago to gauge general trend
 def trend_ok(df, direction, lb=5):
     if len(df) < lb+1: return True
     if direction == "BUY":
-        h = df["high"].iloc[-lb:].values
-        return all(h[i] <= h[i+1] for i in range(len(h)-1))
-    l = df["low"].iloc[-lb:].values
-    return all(l[i] >= l[i+1] for i in range(len(l)-1))
+        return df["close"].iloc[-1] > df["close"].iloc[-(lb+1)]
+    return df["close"].iloc[-1] < df["close"].iloc[-(lb+1)]
 
 # ══════════════════════════════════════════════════════
 # SCORER (identical to production)
@@ -280,12 +290,12 @@ def score_signal(df, direction, sec_avg, vol_r, rsi_val):
 
     if vol_r >= VOL_HIGH:   pts += 2; detail.append(f"Vol+2({round(vol_r,1)}x)")
     elif vol_r >= VOL_LOW:  pts += 1; detail.append(f"Vol+1({round(vol_r,1)}x)")
-    else:                             detail.append(f"Vol+0({round(vol_r,1)}x)")
+    else:                                 detail.append(f"Vol+0({round(vol_r,1)}x)")
 
     abs_s = abs(sec_avg)
     if abs_s >= SEC_HIGH:   pts += 2; detail.append(f"Sec+2({round(abs_s,2)}%)")
     elif abs_s >= SEC_LOW:  pts += 1; detail.append(f"Sec+1({round(abs_s,2)}%)")
-    else:                             detail.append(f"Sec+0({round(abs_s,2)}%)")
+    else:                                 detail.append(f"Sec+0({round(abs_s,2)}%)")
 
     if body_ratio(df) >= BODY_MIN: pts += 2; detail.append("Body+2")
     else:                                    detail.append("Body+0")
@@ -405,7 +415,7 @@ def fmt_final(all_trades):
         f"Total trades  : {tot}  (avg {round(tot/20,1)}/day)\n"
         f"Wins          : {w}  ({wr}%)\n"
         f"Losses        : {l}\n"
-        f"Total P&amp;L     : {'+' if tp>=0 else ''}{tp}%\n"
+        f"Total P&amp;L      : {'+' if tp>=0 else ''}{tp}%\n"
         f"Avg win       : +{aw}%\n"
         f"Avg loss      : {al}%\n"
         f"Actual R:R    : 1 : {rr}\n"
@@ -443,7 +453,7 @@ def run_backtest():
 
         print(f"\n══ {date_str} ══")
 
-        # Fetch all candles for the day
+        # Fetch all candles for the day (and previous 5 days for indicators)
         cache = {}
         for sector, stocks in SECTORS.items():
             for symbol, token in stocks.items():
