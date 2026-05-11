@@ -1,9 +1,36 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║          PRO TRADING BOT — GRADE + CONFLUENCE HYBRID             ║
+║                                                                  ║
+║  Built on your grade system (A+/B/C) + upgraded with:            ║
+║  • Confluence scoring (5 layers, 10 pts) inside each grade       ║
+║  • ATR-based SL & Target (not fixed %)                           ║
+║  • EMA 9/21 crossover confirmation                               ║
+║  • RSI zone filter (no overbought/oversold entries)              ║
+║  • Volume spike confirmation (2.5× avg minimum)                  ║
+║  • Candle body strength check                                    ║
+║  • Per-symbol 45-min cooldown                                    ║
+║  • Max 2 trades/day hard cap                                     ║
+║  • Circuit breaker (2 losses → stop for the day)                 ║
+║  • Auto token refresh at 08:00 IST                               ║
+║  • Background SL/Target monitor per trade                        ║
+║  • SQLite trade log with daily P&L summary                       ║
+║  • NSE holiday calendar (2025 + 2026)                            ║
+║                                                                  ║
+║  GRADE RULES (your original logic, now WITH confluence gate):    ║
+║    A+ : Stock ≥1.50% AND Sector ≥0.75% AND score ≥7              ║
+║    B  : Stock ≥0.75% AND Sector ≥0.40% AND score ≥8              ║
+║    C  : Stock ≥0.25% AND Sector ≥0.20% AND score ≥9 (strict)     ║
+║    D  : Below all thresholds → never fire                        ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
 import os
 import sqlite3
 import pandas as pd
 import pyotp
 import requests
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from SmartApi import SmartConnect
 import pytz
 import time
@@ -20,12 +47,13 @@ TG_TOKEN    = os.getenv("TG_TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
 
 # ─────────────────────────────────────────────────────
-# GLOBALS
+# GLOBALS & LOCKS
 # ─────────────────────────────────────────────────────
 API_OBJECT      = None
 IST             = pytz.timezone("Asia/Kolkata")
 DB_PATH         = "trades.db"
 TOKEN_REFRESHED = None
+API_LOCK        = threading.RLock()  # Prevents thread collisions on API calls
 
 # ─────────────────────────────────────────────────────
 # RATE LIMITS
@@ -78,6 +106,14 @@ TGT_FB      = 0.60
 # NSE HOLIDAYS 2025 + 2026
 # ─────────────────────────────────────────────────────
 NSE_HOLIDAYS = {
+    datetime(2025,1,26).date(),  datetime(2025,2,26).date(),
+    datetime(2025,3,14).date(),  datetime(2025,3,31).date(),
+    datetime(2025,4,10).date(),  datetime(2025,4,14).date(),
+    datetime(2025,4,18).date(),  datetime(2025,5,1).date(),
+    datetime(2025,8,15).date(),  datetime(2025,8,27).date(),
+    datetime(2025,10,2).date(),  datetime(2025,10,21).date(),
+    datetime(2025,10,22).date(), datetime(2025,11,5).date(),
+    datetime(2025,12,25).date(),
     datetime(2026,1,26).date(),  datetime(2026,3,20).date(),
     datetime(2026,4,2).date(),   datetime(2026,4,3).date(),
     datetime(2026,4,14).date(),  datetime(2026,5,1).date(),
@@ -118,7 +154,7 @@ SECTORS = {
 # DATABASE
 # ══════════════════════════════════════════════════════
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,7 +185,7 @@ def init_db():
     conn.close()
 
 def log_trade(sig):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     c    = conn.cursor()
     now  = now_ist()
     c.execute("""
@@ -172,7 +208,7 @@ def log_trade(sig):
     return tid
 
 def update_result(tid, result, exit_p, pnl):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute(
         "UPDATE trades SET result=?,exit_price=?,pnl_pct=? WHERE id=?",
         (result, exit_p, pnl, tid)
@@ -181,7 +217,7 @@ def update_result(tid, result, exit_p, pnl):
     conn.close()
 
 def get_today_stats():
-    conn  = sqlite3.connect(DB_PATH)
+    conn  = sqlite3.connect(DB_PATH, timeout=10)
     today = now_ist().strftime("%Y-%m-%d")
     rows  = conn.execute(
         "SELECT result, COUNT(*) FROM trades WHERE date=? GROUP BY result", (today,)
@@ -226,70 +262,76 @@ def is_rate_limit(e):
     return "exceeding access rate" in m or "access denied" in m
 
 # ══════════════════════════════════════════════════════
-# SESSION MANAGEMENT
+# SESSION MANAGEMENT (Secured with API_LOCK)
 # ══════════════════════════════════════════════════════
 def ensure_fresh():
     global API_OBJECT, TOKEN_REFRESHED
     now    = now_ist()
     cutoff = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    if TOKEN_REFRESHED is None or TOKEN_REFRESHED < cutoff:
-        print(f"[session] Refreshing at {now.strftime('%H:%M')}")
-        API_OBJECT = login()
-        if API_OBJECT:
-            TOKEN_REFRESHED = now
-        return API_OBJECT is not None
+    with API_LOCK:
+        if TOKEN_REFRESHED is None or TOKEN_REFRESHED < cutoff:
+            print(f"[session] Refreshing at {now.strftime('%H:%M')}")
+            API_OBJECT = login()
+            if API_OBJECT:
+                TOKEN_REFRESHED = now
+            return API_OBJECT is not None
     return True
 
 def login():
-    try:
-        obj  = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-        if not data or data.get("status") is False:
-            send(f"❌ Login failed: {data}")
+    with API_LOCK:
+        try:
+            obj  = SmartConnect(api_key=API_KEY)
+            totp = pyotp.TOTP(TOTP_SECRET).now()
+            data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+            if not data or data.get("status") is False:
+                send(f"❌ Login failed: {data}")
+                return None
+            rf = data["data"]["refreshToken"]
+            obj.getfeedToken()
+            profile = obj.getProfile(rf)
+            if not profile or not profile.get("data"):
+                send("❌ Profile validation failed")
+                return None
+            obj.generateToken(rf)
+            name = profile["data"].get("name", CLIENT_ID)
+            send(f"✅ <b>Login OK</b> — {name} ({profile['data']['clientcode']})")
+            return obj
+        except Exception as e:
+            send(f"❌ Login error: {e}")
             return None
-        rf = data["data"]["refreshToken"]
-        obj.getfeedToken()
-        profile = obj.getProfile(rf)
-        if not profile or not profile.get("data"):
-            send("❌ Profile validation failed")
-            return None
-        obj.generateToken(rf)
-        name = profile["data"].get("name", CLIENT_ID)
-        send(f"✅ <b>Login OK</b> — {name} ({profile['data']['clientcode']})")
-        return obj
-    except Exception as e:
-        send(f"❌ Login error: {e}")
-        return None
 
 # ══════════════════════════════════════════════════════
-# CANDLE FETCH
+# CANDLE FETCH (Indicator Warmup Fix + API Lock)
 # ══════════════════════════════════════════════════════
 def get_data(token, symbol=""):
     global API_OBJECT
     now   = now_ist()
-    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    # Fetch from 4 days ago to properly warm up EMA 21, RSI 14, and ATR 14
+    start = now - timedelta(days=4)
+    start = start.replace(hour=9, minute=15, second=0, microsecond=0)
     fs    = start.strftime("%Y-%m-%d %H:%M")
     ts    = now.strftime("%Y-%m-%d %H:%M")
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = API_OBJECT.getCandleData({
-                "exchange":"NSE","symboltoken":token,
-                "interval":"FIVE_MINUTE",
-                "fromdate":fs,"todate":ts,
-            })
-            if resp and resp.get("errorCode") == "AG8001":
-                send("⚠️ Session expired — re-logging")
-                API_OBJECT = login()
-                if not API_OBJECT: return pd.DataFrame()
-                continue
+            with API_LOCK:
+                resp = API_OBJECT.getCandleData({
+                    "exchange":"NSE","symboltoken":token,
+                    "interval":"FIVE_MINUTE",
+                    "fromdate":fs,"todate":ts,
+                })
+                if resp and resp.get("errorCode") == "AG8001":
+                    send("⚠️ Session expired — re-logging")
+                    API_OBJECT = login()
+                    if not API_OBJECT: return pd.DataFrame()
+                    continue
+            
             if resp and resp.get("data"):
                 return pd.DataFrame(
                     resp["data"],
                     columns=["time","open","high","low","close","volume"]
                 )
-            return pd.DataFrame()
+                return pd.DataFrame()
         except Exception as e:
             if is_rate_limit(e):
                 wait = RETRY_BACKOFF * attempt
@@ -343,22 +385,18 @@ def is_news_spike(df):
     c = df.iloc[-1]
     return abs(c["close"]-c["open"])/c["open"]*100 > 0.50 if c["open"]>0 else False
 
+# Fixed overly strict momentum filter
 def trend_continuation(df, direction, lb=5):
-    if len(df) < lb+1: return True
+    if len(df) < lb + 1: return True
     if direction == "BUY":
-        h = df["high"].iloc[-lb:].values
-        return all(h[i] <= h[i+1] for i in range(len(h)-1))
-    l = df["low"].iloc[-lb:].values
-    return all(l[i] >= l[i+1] for i in range(len(l)-1))
+        return df["close"].iloc[-1] > df["close"].iloc[-(lb+1)]
+    else:
+        return df["close"].iloc[-1] < df["close"].iloc[-(lb+1)]
 
 # ══════════════════════════════════════════════════════
 # GRADE ENGINE  (your original logic, preserved exactly)
 # ══════════════════════════════════════════════════════
 def assign_grade(stock_pct, sector_pct):
-    """
-    Returns (grade, description, emoji) or (None, None, None) if grade D.
-    Your original thresholds — untouched.
-    """
     s, sec = abs(stock_pct), abs(sector_pct)
     if s >= GRADE_AP_STOCK and sec >= GRADE_AP_SEC:
         return "A+", "High Recommendation — Strong Momentum", "🚀"
@@ -372,10 +410,6 @@ def assign_grade(stock_pct, sector_pct):
 # CONFLUENCE SCORER  (quality gate within each grade)
 # ══════════════════════════════════════════════════════
 def confluence_score(df, direction, sector_avg, vr, rsi_val):
-    """
-    Max 10 pts across 5 layers.
-    Used to filter within each grade — different min scores per grade.
-    """
     pts = 0; detail = []
 
     # L1 — EMA crossover (+2, already confirmed before calling)
@@ -436,7 +470,6 @@ def recommend_strike(symbol, ltp, direction, grade, a, rsi_val, vr_val):
     itm  = (atm-iv) if direction=="BUY" else (atm+iv)
     ap   = (a/ltp*100) if a and ltp > 0 else 999
 
-    # ITM justified only for A+ with strong vol + RSI momentum + low volatility
     use_itm = (
         grade == "A+"
         and vr_val >= 3.5
@@ -448,23 +481,17 @@ def recommend_strike(symbol, ltp, direction, grade, a, rsi_val, vr_val):
     return rec, f"{val} {opt}", f"{atm} {opt}", f"{itm} {opt}"
 
 # ══════════════════════════════════════════════════════
-# MARKET SCANNER
+# MARKET SCANNER (String Mask Fix for Multi-Day)
 # ══════════════════════════════════════════════════════
 def scan_market(last_alerted: dict):
-    """
-    Two-phase scan:
-      Phase 1 — Fetch all candles, compute grade + indicators
-      Phase 2 — Apply confluence score gate per grade
-      Return list sorted by: grade rank → score → abs(change)
-    """
     raw        = []
     sector_raw = {}
     now        = now_ist()
+    today_str  = now.strftime("%Y-%m-%d")
 
     for sector, stocks in SECTORS.items():
         for symbol, token in stocks.items():
 
-            # Cooldown check
             if symbol in last_alerted:
                 mins = (now - last_alerted[symbol]).total_seconds() / 60
                 if mins < SIGNAL_COOLDOWN_MIN:
@@ -474,11 +501,19 @@ def scan_market(last_alerted: dict):
             df = get_data(token, symbol)
             time.sleep(CANDLE_DELAY)
 
-            if len(df) < MIN_CANDLES or df.iloc[0]["open"] == 0:
+            # Ensure we have enough data overall for the indicator math
+            if len(df) < MIN_CANDLES:
                 continue
 
-            op     = df.iloc[0]["open"]
-            cp     = df.iloc[-1]["close"]
+            # Safely extract today's specific price action using string mask
+            today_mask = df["time"].str.startswith(today_str)
+            today_df   = df[today_mask]
+
+            if today_df.empty or today_df.iloc[0]["open"] == 0:
+                continue
+
+            op     = today_df.iloc[0]["open"]  # Accurate 09:15 AM today open
+            cp     = today_df.iloc[-1]["close"]
             change = (cp - op) / op * 100
             sector_raw.setdefault(sector, []).append(change)
 
@@ -500,42 +535,34 @@ def scan_market(last_alerted: dict):
         symbol = r["symbol"]
         sa     = sec_avg.get(sector, 0)
 
-        # ── Step 1: Assign grade ─────────────────────
         grade, desc, emoji = assign_grade(change, sa)
         if grade is None:
             continue
 
-        # ── Step 2: EMA crossover (hard requirement) ─
         cross = ema_crossover(df)
         if cross is None:
             continue
 
-        # Direction must agree with day change
         if cross == "BUY"   and change <= 0: continue
         if cross == "SHORT" and change >= 0: continue
 
-        # ── Step 3: Hard disqualifiers ───────────────
         if is_doji(df):             continue
         if is_news_spike(df):       continue
         if not trend_continuation(df, cross): continue
 
-        # ── Step 4: Compute indicators ───────────────
         vr_val  = vol_ratio(df)
         rsi_val = calc_rsi(df["close"], RSI_PERIOD).iloc[-1]
         a       = calc_atr(df)
 
-        # ── Step 5: RSI zone check ───────────────────
         if cross=="BUY"   and not (RSI_BUY_LO <= rsi_val <= RSI_BUY_HI): continue
         if cross=="SHORT" and not (RSI_SHT_LO <= rsi_val <= RSI_SHT_HI): continue
 
-        # ── Step 6: Confluence score ─────────────────
         score, detail = confluence_score(df, cross, sa, vr_val, rsi_val)
         min_score = GRADE_MIN_SCORE.get(grade, 8)
         if score < min_score:
             print(f"  [{symbol}] grade={grade} score={score}/{min_score} needed — skip")
             continue
 
-        # ── Step 7: Build trade params ───────────────
         sl, target, sp, tp = build_trade_params(ltp, cross, grade, a)
         rec, strike, atm_s, itm_s = recommend_strike(symbol, ltp, cross, grade, a, rsi_val, vr_val)
         rr = round(tp/sp, 1) if sp else "N/A"
@@ -566,7 +593,6 @@ def scan_market(last_alerted: dict):
             "itm_strike":  itm_s,
         })
 
-    # Sort: A+ first, then by score, then by abs(change)
     grade_rank = {"A+": 3, "B": 2, "C": 1}
     signals.sort(
         key=lambda x: (grade_rank.get(x["grade"],0), x["score"], abs(x["change"])),
@@ -652,7 +678,6 @@ def build_alert(sig, trade_num):
             f"   ITM : {sig['itm_strike']} (not justified for this grade)"
         )
 
-    # Grade-specific note
     note = {
         "A+": "✅ Strong setup — EMA + RSI + Volume all confirmed",
         "B":  "👁 Good setup — verify chart before entry",
@@ -746,7 +771,6 @@ def main():
             send("📈 Market open — scanning from 09:25 IST")
             open_sent = True
 
-        # Circuit breaker
         stats = get_today_stats()
         if stats["LOSS"] >= MAX_DAILY_LOSS:
             send(f"🛑 {MAX_DAILY_LOSS} losses today — scanning stopped")
@@ -754,7 +778,6 @@ def main():
             if market_closed(now): break
             continue
 
-        # Daily cap
         trades_today = len(alerts_sent)
         if trades_today >= MAX_TRADES_PER_DAY:
             time.sleep(SCAN_INTERVAL_SEC)
