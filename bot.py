@@ -1,6 +1,7 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          PRO TRADING BOT — GRADE + CONFLUENCE HYBRID             ║
+║          PRO TRADING BOT — SILENT PRODUCTION HYBRID              ║
 ║                                                                  ║
 ║  Built on your grade system (A+/B/C) + upgraded with:            ║
 ║  • Confluence scoring (5 layers, 10 pts) inside each grade       ║
@@ -16,12 +17,7 @@
 ║  • Background SL/Target monitor per trade                        ║
 ║  • SQLite trade log with daily P&L summary                       ║
 ║  • NSE holiday calendar (2025 + 2026)                            ║
-║                                                                  ║
-║  GRADE RULES (your original logic, now WITH confluence gate):    ║
-║    A+ : Stock ≥1.50% AND Sector ≥0.75% AND score ≥7              ║
-║    B  : Stock ≥0.75% AND Sector ≥0.40% AND score ≥8              ║
-║    C  : Stock ≥0.25% AND Sector ≥0.20% AND score ≥9 (strict)     ║
-║    D  : Below all thresholds → never fire                        ║
+║  • Clean, silent console execution (zero loop noise)             ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -66,9 +62,9 @@ RETRY_BACKOFF = 2.0
 # STRATEGY CONSTANTS
 # ─────────────────────────────────────────────────────
 MAX_TRADES_PER_DAY  = 2
-SCAN_INTERVAL_SEC   = 300      # scan every 5 min
-SIGNAL_COOLDOWN_MIN = 45       # per-symbol cooldown (minutes)
-MIN_CANDLES         = 25       # minimum candles needed for indicators
+SCAN_INTERVAL_SEC   = 300             # scan every 5 min
+SIGNAL_COOLDOWN_MIN = 45              # per-symbol cooldown (minutes)
+MIN_CANDLES         = 25              # minimum candles needed for indicators
 SCAN_END_TIME       = dtime(14, 45)   # stop scanning after 14:45
 
 # Circuit breaker
@@ -91,7 +87,7 @@ GRADE_AP_STOCK  = 1.50;  GRADE_AP_SEC  = 0.75
 GRADE_B_STOCK   = 0.75;  GRADE_B_SEC   = 0.40
 GRADE_C_STOCK   = 0.25;  GRADE_C_SEC   = 0.20
 
-# Min score per grade to fire (C is hardest because move is weak)
+# Min score per grade to fire
 GRADE_MIN_SCORE = {"A+": 7, "B": 8, "C": 9}
 
 # ATR-based risk management
@@ -229,7 +225,7 @@ def get_today_stats():
     return s
 
 # ══════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM  (Silent failure on exceptions)
 # ══════════════════════════════════════════════════════
 def send(msg):
     try:
@@ -238,8 +234,8 @@ def send(msg):
             data={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"},
             timeout=10
         )
-    except Exception as e:
-        print(f"[telegram] {e}")
+    except:
+        pass  # Completely silent to keep console clean
 
 # ══════════════════════════════════════════════════════
 # HELPERS
@@ -270,7 +266,6 @@ def ensure_fresh():
     cutoff = now.replace(hour=8, minute=0, second=0, microsecond=0)
     with API_LOCK:
         if TOKEN_REFRESHED is None or TOKEN_REFRESHED < cutoff:
-            print(f"[session] Refreshing at {now.strftime('%H:%M')}")
             API_OBJECT = login()
             if API_OBJECT:
                 TOKEN_REFRESHED = now
@@ -283,27 +278,18 @@ def login():
             obj  = SmartConnect(api_key=API_KEY)
             totp = pyotp.TOTP(TOTP_SECRET).now()
             data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-            if not data or data.get("status") is False:
-                send(f"❌ Login failed: {data}")
-                return None
+            if not data or data.get("status") is False: return None
             rf = data["data"]["refreshToken"]
             obj.getfeedToken()
-            profile = obj.getProfile(rf)
-            if not profile or not profile.get("data"):
-                send("❌ Profile validation failed")
-                return None
             obj.generateToken(rf)
-            name = profile["data"].get("name", CLIENT_ID)
-            send(f"✅ <b>Login OK</b> — {name} ({profile['data']['clientcode']})")
             return obj
-        except Exception as e:
-            send(f"❌ Login error: {e}")
+        except:
             return None
 
 # ══════════════════════════════════════════════════════
 # CANDLE FETCH (Indicator Warmup Fix + API Lock)
 # ══════════════════════════════════════════════════════
-def get_data(token, symbol=""):
+def get_data(token):
     global API_OBJECT
     now   = now_ist()
     # Fetch from 4 days ago to properly warm up EMA 21, RSI 14, and ATR 14
@@ -321,7 +307,6 @@ def get_data(token, symbol=""):
                     "fromdate":fs,"todate":ts,
                 })
                 if resp and resp.get("errorCode") == "AG8001":
-                    send("⚠️ Session expired — re-logging")
                     API_OBJECT = login()
                     if not API_OBJECT: return pd.DataFrame()
                     continue
@@ -331,14 +316,10 @@ def get_data(token, symbol=""):
                     resp["data"],
                     columns=["time","open","high","low","close","volume"]
                 )
-                return pd.DataFrame()
         except Exception as e:
             if is_rate_limit(e):
-                wait = RETRY_BACKOFF * attempt
-                print(f"[rate_limit] {symbol} attempt {attempt}, wait {wait}s")
-                time.sleep(wait)
+                time.sleep(RETRY_BACKOFF * attempt)
             else:
-                print(f"[get_data] {symbol}: {e}")
                 return pd.DataFrame()
     return pd.DataFrame()
 
@@ -385,7 +366,6 @@ def is_news_spike(df):
     c = df.iloc[-1]
     return abs(c["close"]-c["open"])/c["open"]*100 > 0.50 if c["open"]>0 else False
 
-# Fixed overly strict momentum filter
 def trend_continuation(df, direction, lb=5):
     if len(df) < lb + 1: return True
     if direction == "BUY":
@@ -394,7 +374,7 @@ def trend_continuation(df, direction, lb=5):
         return df["close"].iloc[-1] < df["close"].iloc[-(lb+1)]
 
 # ══════════════════════════════════════════════════════
-# GRADE ENGINE  (your original logic, preserved exactly)
+# GRADE ENGINE
 # ══════════════════════════════════════════════════════
 def assign_grade(stock_pct, sector_pct):
     s, sec = abs(stock_pct), abs(sector_pct)
@@ -407,15 +387,12 @@ def assign_grade(stock_pct, sector_pct):
     return None, None, None
 
 # ══════════════════════════════════════════════════════
-# CONFLUENCE SCORER  (quality gate within each grade)
+# CONFLUENCE SCORER
 # ══════════════════════════════════════════════════════
 def confluence_score(df, direction, sector_avg, vr, rsi_val):
     pts = 0; detail = []
-
-    # L1 — EMA crossover (+2, already confirmed before calling)
     pts += 2; detail.append("EMA+2")
 
-    # L2 — RSI zone (+2)
     if direction=="BUY"   and RSI_BUY_LO <= rsi_val <= RSI_BUY_HI:
         pts += 2; detail.append(f"RSI+2({round(rsi_val,1)})")
     elif direction=="SHORT" and RSI_SHT_LO <= rsi_val <= RSI_SHT_HI:
@@ -423,18 +400,15 @@ def confluence_score(df, direction, sector_avg, vr, rsi_val):
     else:
         detail.append(f"RSI+0({round(rsi_val,1)})")
 
-    # L3 — Volume (+2 or +1)
     if vr >= VOL_HIGH:  pts += 2; detail.append(f"Vol+2({round(vr,1)}x)")
     elif vr >= VOL_LOW: pts += 1; detail.append(f"Vol+1({round(vr,1)}x)")
     else:                         detail.append(f"Vol+0({round(vr,1)}x)")
 
-    # L4 — Sector strength (+2 or +1)
     asec = abs(sector_avg)
     if asec >= 0.75:   pts += 2; detail.append(f"Sec+2({round(asec,2)}%)")
     elif asec >= 0.40: pts += 1; detail.append(f"Sec+1({round(asec,2)}%)")
     else:                        detail.append(f"Sec+0({round(asec,2)}%)")
 
-    # L5 — Candle body (+2)
     if candle_body_ratio(df) >= BODY_MIN:
         pts += 2; detail.append("Body+2")
     else:
@@ -443,7 +417,7 @@ def confluence_score(df, direction, sector_avg, vr, rsi_val):
     return pts, " | ".join(detail)
 
 # ══════════════════════════════════════════════════════
-# TRADE PARAMS — ATR-based, grade-aware SL
+# TRADE PARAMS — ATR-based
 # ══════════════════════════════════════════════════════
 def build_trade_params(ltp, direction, grade, a):
     sl_mult = {"A+": SL_MULT_AP, "B": SL_MULT_B, "C": SL_MULT_C}.get(grade, SL_MULT_B)
@@ -461,7 +435,7 @@ def build_trade_params(ltp, direction, grade, a):
     return sl, target, sp, tp
 
 # ══════════════════════════════════════════════════════
-# STRIKE RECOMMENDATION (ATM vs ITM)
+# STRIKE RECOMMENDATION
 # ══════════════════════════════════════════════════════
 def recommend_strike(symbol, ltp, direction, grade, a, rsi_val, vr_val):
     iv   = STRIKE_INTERVALS.get(symbol, 50)
@@ -481,7 +455,7 @@ def recommend_strike(symbol, ltp, direction, grade, a, rsi_val, vr_val):
     return rec, f"{val} {opt}", f"{atm} {opt}", f"{itm} {opt}"
 
 # ══════════════════════════════════════════════════════
-# MARKET SCANNER (String Mask Fix for Multi-Day)
+# MARKET SCANNER (Silent & String Mask Secured)
 # ══════════════════════════════════════════════════════
 def scan_market(last_alerted: dict):
     raw        = []
@@ -491,28 +465,22 @@ def scan_market(last_alerted: dict):
 
     for sector, stocks in SECTORS.items():
         for symbol, token in stocks.items():
-
             if symbol in last_alerted:
-                mins = (now - last_alerted[symbol]).total_seconds() / 60
-                if mins < SIGNAL_COOLDOWN_MIN:
+                if (now - last_alerted[symbol]).total_seconds() / 60 < SIGNAL_COOLDOWN_MIN:
                     time.sleep(CANDLE_DELAY)
                     continue
 
-            df = get_data(token, symbol)
+            df = get_data(token)
             time.sleep(CANDLE_DELAY)
 
-            # Ensure we have enough data overall for the indicator math
             if len(df) < MIN_CANDLES:
                 continue
 
-            # Safely extract today's specific price action using string mask
-            today_mask = df["time"].str.startswith(today_str)
-            today_df   = df[today_mask]
-
+            today_df = df[df["time"].str.startswith(today_str)]
             if today_df.empty or today_df.iloc[0]["open"] == 0:
                 continue
 
-            op     = today_df.iloc[0]["open"]  # Accurate 09:15 AM today open
+            op     = today_df.iloc[0]["open"]  # Accurate today open
             cp     = today_df.iloc[-1]["close"]
             change = (cp - op) / op * 100
             sector_raw.setdefault(sector, []).append(change)
@@ -528,27 +496,20 @@ def scan_market(last_alerted: dict):
     signals = []
 
     for r in raw:
-        df     = r["df"]
-        change = r["change"]
-        ltp    = r["ltp"]
-        sector = r["sector"]
-        symbol = r["symbol"]
-        sa     = sec_avg.get(sector, 0)
+        df, change, ltp = r["df"], r["change"], r["ltp"]
+        sector, symbol  = r["sector"], r["symbol"]
+        sa = sec_avg.get(sector, 0)
 
         grade, desc, emoji = assign_grade(change, sa)
-        if grade is None:
-            continue
+        if grade is None: continue
 
         cross = ema_crossover(df)
-        if cross is None:
-            continue
+        if cross is None: continue
 
         if cross == "BUY"   and change <= 0: continue
         if cross == "SHORT" and change >= 0: continue
 
-        if is_doji(df):             continue
-        if is_news_spike(df):       continue
-        if not trend_continuation(df, cross): continue
+        if is_doji(df) or is_news_spike(df) or not trend_continuation(df, cross): continue
 
         vr_val  = vol_ratio(df)
         rsi_val = calc_rsi(df["close"], RSI_PERIOD).iloc[-1]
@@ -558,46 +519,23 @@ def scan_market(last_alerted: dict):
         if cross=="SHORT" and not (RSI_SHT_LO <= rsi_val <= RSI_SHT_HI): continue
 
         score, detail = confluence_score(df, cross, sa, vr_val, rsi_val)
-        min_score = GRADE_MIN_SCORE.get(grade, 8)
-        if score < min_score:
-            print(f"  [{symbol}] grade={grade} score={score}/{min_score} needed — skip")
-            continue
+        if score < GRADE_MIN_SCORE.get(grade, 8): continue
 
         sl, target, sp, tp = build_trade_params(ltp, cross, grade, a)
         rec, strike, atm_s, itm_s = recommend_strike(symbol, ltp, cross, grade, a, rsi_val, vr_val)
-        rr = round(tp/sp, 1) if sp else "N/A"
 
         signals.append({
-            "symbol":      symbol,
-            "sector":      sector,
-            "direction":   cross,
-            "grade":       grade,
-            "grade_desc":  desc,
-            "grade_emoji": emoji,
-            "score":       score,
-            "score_detail":detail,
-            "ltp":         ltp,
-            "change":      change,
-            "sec_change":  sa,
-            "rsi":         rsi_val,
-            "vol_ratio":   vr_val,
-            "atr":         a,
-            "sl":          sl,
-            "target":      target,
-            "sl_pct":      sp,
-            "tgt_pct":     tp,
-            "rr":          rr,
-            "strike":      strike,
-            "strike_type": rec,
-            "atm_strike":  atm_s,
-            "itm_strike":  itm_s,
+            "symbol": symbol, "sector": sector, "direction": cross,
+            "grade": grade, "grade_desc": desc, "grade_emoji": emoji,
+            "score": score, "score_detail": detail, "ltp": ltp,
+            "change": change, "sec_change": sa, "rsi": rsi_val,
+            "vol_ratio": vr_val, "atr": a, "sl": sl, "target": target,
+            "sl_pct": sp, "tgt_pct": tp, "rr": round(tp/sp, 1) if sp else "N/A",
+            "strike": strike, "strike_type": rec, "atm_strike": atm_s, "itm_strike": itm_s,
         })
 
     grade_rank = {"A+": 3, "B": 2, "C": 1}
-    signals.sort(
-        key=lambda x: (grade_rank.get(x["grade"],0), x["score"], abs(x["change"])),
-        reverse=True
-    )
+    signals.sort(key=lambda x: (grade_rank.get(x["grade"],0), x["score"], abs(x["change"])), reverse=True)
     return signals
 
 # ══════════════════════════════════════════════════════
@@ -606,54 +544,40 @@ def scan_market(last_alerted: dict):
 class Monitor(threading.Thread):
     def __init__(self, tid, symbol, token, direction, sl, target, entry, grade):
         super().__init__(daemon=True)
-        self.tid       = tid
-        self.symbol    = symbol
-        self.token     = token
-        self.direction = direction
-        self.sl        = sl
-        self.target    = target
-        self.entry     = entry
-        self.grade     = grade
-        self.active    = True
+        self.tid, self.symbol, self.token = tid, symbol, token
+        self.direction, self.sl, self.target = direction, sl, target
+        self.entry, self.grade = entry, grade
+        self.active = True
 
     def run(self):
         while self.active:
             time.sleep(60)
             if market_closed(now_ist()):
                 self._squareoff(); break
-            df = get_data(self.token, self.symbol)
+            df = get_data(self.token)
             if df.empty: continue
             ltp = df.iloc[-1]["close"]
             if self.direction == "BUY":
-                if ltp <= self.sl:     self._exit("SL HIT",     ltp); break
+                if ltp <= self.sl:     self._exit("SL HIT", ltp); break
                 if ltp >= self.target: self._exit("TARGET HIT", ltp); break
             else:
-                if ltp >= self.sl:     self._exit("SL HIT",     ltp); break
+                if ltp >= self.sl:     self._exit("SL HIT", ltp); break
                 if ltp <= self.target: self._exit("TARGET HIT", ltp); break
 
     def _exit(self, label, ep):
         pnl = round(((ep-self.entry)/self.entry*100)*(1 if self.direction=="BUY" else -1),2)
         res = "WIN" if "TARGET" in label else "LOSS"
         update_result(self.tid, res, ep, pnl)
-        e   = "✅" if res=="WIN" else "❌"
-        send(
-            f"{e} <b>{label}</b>  [Grade {self.grade}]\n"
-            f"Symbol : {self.symbol}  ({self.direction})\n"
-            f"Entry  : ₹{self.entry}  →  Exit: ₹{ep}\n"
-            f"P&amp;L    : {'+' if pnl>0 else ''}{pnl}%\n"
-            f"Time   : {now_ist().strftime('%H:%M IST')}"
-        )
+        e = "✅" if res=="WIN" else "❌"
+        send(f"{e} <b>{label}</b>  [Grade {self.grade}]\nSymbol : {self.symbol} ({self.direction})\nEntry  : ₹{self.entry} → Exit: ₹{ep}\nP&amp;L    : {'+' if pnl>0 else ''}{pnl}%\nTime   : {now_ist().strftime('%H:%M IST')}")
         self.active = False
 
     def _squareoff(self):
-        df  = get_data(self.token, self.symbol)
-        ep  = df.iloc[-1]["close"] if not df.empty else self.entry
+        df = get_data(self.token)
+        ep = df.iloc[-1]["close"] if not df.empty else self.entry
         pnl = round(((ep-self.entry)/self.entry*100)*(1 if self.direction=="BUY" else -1),2)
         update_result(self.tid, "WIN" if pnl>0 else "LOSS", ep, pnl)
-        send(
-            f"⏰ <b>Square-off at close</b>  [Grade {self.grade}]\n"
-            f"{self.symbol}  Exit ₹{ep}  P&amp;L {'+' if pnl>0 else ''}{pnl}%"
-        )
+        send(f"⏰ <b>Square-off at close</b>  [Grade {self.grade}]\n{self.symbol} Exit ₹{ep} P&amp;L {'+' if pnl>0 else ''}{pnl}%")
         self.active = False
 
 # ══════════════════════════════════════════════════════
@@ -663,26 +587,16 @@ def score_bar(s):
     return f"{'█'*s}{'░'*(10-s)} {s}/10"
 
 def build_alert(sig, trade_num):
-    d   = sig["direction"]
-    rec = sig["strike_type"]
+    d, rec = sig["direction"], sig["strike_type"]
     a_s = f"₹{round(sig['atr'],2)}" if sig["atr"] else "N/A"
 
-    if rec == "ITM":
-        strike_block = (
-            f"🎯 <b>Strike: ITM</b>  →  {sig['itm_strike']}\n"
-            f"   ATM alt : {sig['atm_strike']} (safer if unsure)"
-        )
-    else:
-        strike_block = (
-            f"🎯 <b>Strike: ATM</b>  →  {sig['atm_strike']}\n"
-            f"   ITM : {sig['itm_strike']} (not justified for this grade)"
-        )
+    strike_block = (
+        f"🎯 <b>Strike: ITM</b> → {sig['itm_strike']}\n   ATM alt : {sig['atm_strike']} (safer if unsure)"
+        if rec == "ITM" else
+        f"🎯 <b>Strike: ATM</b> → {sig['atm_strike']}\n   ITM : {sig['itm_strike']} (not justified for this grade)"
+    )
 
-    note = {
-        "A+": "✅ Strong setup — EMA + RSI + Volume all confirmed",
-        "B":  "👁 Good setup — verify chart before entry",
-        "C":  "⚠️ Borderline — apply strict human logic before entering",
-    }.get(sig["grade"], "")
+    note = {"A+": "✅ Strong setup — EMA + RSI + Volume all confirmed", "B": "👁 Good setup — verify chart before entry", "C": "⚠️ Borderline — apply strict human logic before entering"}.get(sig["grade"], "")
 
     return (
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -691,62 +605,34 @@ def build_alert(sig, trade_num):
         f"Direction : {'🟢 BUY (CE)' if d=='BUY' else '🔴 SHORT (PE)'}\n"
         f"Stock     : <b>{sig['symbol']}</b>  ({sig['sector']})\n"
         f"LTP       : ₹{round(sig['ltp'],2)}\n"
-        f"Stock move: {round(sig['change'],2)}%  |  Sector: {round(sig['sec_change'],2)}%\n"
-        f"\n"
-        f"<b>Confluence score</b>\n"
-        f"<code>{score_bar(sig['score'])}</code>\n"
-        f"<code>{sig['score_detail']}</code>\n"
-        f"\n"
-        f"{strike_block}\n"
-        f"\n"
-        f"<b>Risk levels</b>\n"
-        f"Entry  : ₹{round(sig['ltp'],2)}\n"
-        f"SL     : ₹{sig['sl']}  (−{sig['sl_pct']}%)\n"
-        f"Target : ₹{sig['target']}  (+{sig['tgt_pct']}%)\n"
-        f"ATR 14 : {a_s}\n"
-        f"R:R    : 1 : {sig['rr']}\n"
-        f"\n"
-        f"RSI : {round(sig['rsi'],1)}  ·  Vol : {round(sig['vol_ratio'],1)}×\n"
-        f"\n"
-        f"{note}\n"
-        f"Time : {now_ist().strftime('%H:%M IST')}\n"
+        f"Stock move: {round(sig['change'],2)}%  |  Sector: {round(sig['sec_change'],2)}%\n\n"
+        f"<b>Confluence score</b>\n<code>{score_bar(sig['score'])}</code>\n<code>{sig['score_detail']}</code>\n\n"
+        f"{strike_block}\n\n"
+        f"<b>Risk levels</b>\nEntry  : ₹{round(sig['ltp'],2)}\nSL     : ₹{sig['sl']} (−{sig['sl_pct']}%)\nTarget : ₹{sig['target']} (+{sig['tgt_pct']}%)\nATR 14 : {a_s}\nR:R    : 1 : {sig['rr']}\n\n"
+        f"RSI : {round(sig['rsi'],1)} · Vol : {round(sig['vol_ratio'],1)}×\n\n"
+        f"{note}\nTime : {now_ist().strftime('%H:%M IST')}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
 def build_daily_summary(alerts):
-    s    = get_today_stats()
-    tot  = s["WIN"] + s["LOSS"]
-    wr   = round(s["WIN"]/tot*100) if tot else 0
-    lines = [
-        f"📋 <b>Daily Summary — {now_ist().strftime('%d %b %Y')}</b>",
-        f"Alerts  : {len(alerts)}  |  Closed: {tot}",
-        f"Wins    : {s['WIN']}  |  Losses: {s['LOSS']}",
-        f"Win rate: {wr}%",
-        "─────────────────────",
-    ]
+    s = get_today_stats()
+    tot = s["WIN"] + s["LOSS"]
+    wr = round(s["WIN"]/tot*100) if tot else 0
+    lines = [f"📋 <b>Daily Summary — {now_ist().strftime('%d %b %Y')}</b>", f"Alerts  : {len(alerts)} | Closed: {tot}", f"Wins    : {s['WIN']} | Losses: {s['LOSS']}", f"Win rate: {wr}%", "─────────────────────"]
     for i, a in enumerate(alerts, 1):
-        lines.append(
-            f"{i}. {a['grade_emoji']} <b>{a['symbol']}</b> {a['direction']} "
-            f"@ ₹{round(a['ltp'],2)}  "
-            f"[{a['time']}]  Grade {a['grade']}  {a['score']}/10"
-        )
+        lines.append(f"{i}. {a['grade_emoji']} <b>{a['symbol']}</b> {a['direction']} @ ₹{round(a['ltp'],2)} [{a['time']}] Grade {a['grade']} {a['score']}/10")
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════
-# MAIN LOOP
+# MAIN LOOP  (Silent & Structured)
 # ══════════════════════════════════════════════════════
 def main():
     global API_OBJECT
-
     init_db()
+    if not is_trading_day(): return
+    if not ensure_fresh(): return
 
-    if not is_trading_day():
-        send(f"Today ({now_ist().strftime('%d %b %Y, %A')}) is not a trading day.")
-        return
-
-    if not ensure_fresh():
-        return
-
+    # Startup message requested exactly by user
     send(
         f"🤖 <b>Pro Bot started</b> — {now_ist().strftime('%d %b %Y')}\n"
         f"Grades   : A+ / B / C with confluence gate\n"
@@ -756,70 +642,46 @@ def main():
         f"Target   : ATR×{TGT_MULT} for all grades"
     )
 
-    last_alerted:  dict = {}
-    alerts_sent:   list = []
-    monitors:      list = []
-    open_sent            = False
-    closed_sent          = False
-    all_tokens           = {s:t for sec in SECTORS.values() for s,t in sec.items()}
+    print(f"[{now_ist().strftime('%H:%M')}] Silent engine live. Startup confirmation sent.")
+
+    last_alerted, alerts_sent, monitors = {}, [], []
+    all_tokens = {s:t for sec in SECTORS.values() for s,t in sec.items()}
 
     while True:
         now = now_ist()
         ensure_fresh()
 
-        if now.hour == 9 and now.minute >= 20 and not open_sent:
-            send("📈 Market open — scanning from 09:25 IST")
-            open_sent = True
-
         stats = get_today_stats()
-        if stats["LOSS"] >= MAX_DAILY_LOSS:
-            send(f"🛑 {MAX_DAILY_LOSS} losses today — scanning stopped")
-            time.sleep(SCAN_INTERVAL_SEC)
-            if market_closed(now): break
-            continue
-
-        trades_today = len(alerts_sent)
-        if trades_today >= MAX_TRADES_PER_DAY:
+        if stats["LOSS"] >= MAX_DAILY_LOSS or len(alerts_sent) >= MAX_TRADES_PER_DAY:
             time.sleep(SCAN_INTERVAL_SEC)
             if market_closed(now): break
             continue
 
         if scan_window_open(now):
-            print(f"[{now.strftime('%H:%M')}] Scanning... ({trades_today}/{MAX_TRADES_PER_DAY} today)")
-            signals   = scan_market(last_alerted)
-            remaining = MAX_TRADES_PER_DAY - trades_today
+            # Completely silent scan (no repetitive console prints)
+            signals = scan_market(last_alerted)
+            remaining = MAX_TRADES_PER_DAY - len(alerts_sent)
 
             for sig in signals[:remaining]:
-                trade_num = trades_today + 1
+                trade_num = len(alerts_sent) + 1
                 send(build_alert(sig, trade_num))
                 tid = log_trade(sig)
                 last_alerted[sig["symbol"]] = now
                 alerts_sent.append({**sig, "time": now.strftime("%H:%M")})
-                trades_today += 1
-
-                m = Monitor(
-                    tid       = tid,
-                    symbol    = sig["symbol"],
-                    token     = all_tokens.get(sig["symbol"], ""),
-                    direction = sig["direction"],
-                    sl        = sig["sl"],
-                    target    = sig["target"],
-                    entry     = sig["ltp"],
-                    grade     = sig["grade"],
-                )
+                
+                m = Monitor(tid, sig["symbol"], all_tokens.get(sig["symbol"], ""), sig["direction"], sig["sl"], sig["target"], sig["ltp"], sig["grade"])
                 m.start()
                 monitors.append(m)
-                print(f"[{now.strftime('%H:%M')}] FIRED: {sig['symbol']} Grade {sig['grade']} score={sig['score']}/10")
+                
+                # The only console output during the loop occurs when a trade is fired
+                print(f"[{now.strftime('%H:%M')}] ALERT FIRED: {sig['symbol']} Grade {sig['grade']} (Score: {sig['score']}/10)")
 
-        if market_closed(now) and not closed_sent:
+        if market_closed(now):
             for m in monitors: m.active = False
             send(build_daily_summary(alerts_sent))
-            send(f"🔕 Market closed | {now.strftime('%H:%M IST')}")
-            closed_sent = True
             break
 
         time.sleep(SCAN_INTERVAL_SEC)
-
 
 if __name__ == "__main__":
     main()
