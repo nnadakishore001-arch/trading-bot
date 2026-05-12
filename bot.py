@@ -124,41 +124,84 @@ def scan_market():
 
 def main():
     global API_OBJECT
-    if not is_trading_day(): return
-    API_OBJECT = login()
-    if not API_OBJECT: return
 
-    # Startup message - only visible once
+    if not is_trading_day():
+        return
+
+    API_OBJECT = login()
+
+    if not API_OBJECT:
+        return
+
+    # Startup message
     print(f"[{now_ist().strftime('%H:%M')}] Bot is live and scanning silently...")
     send("<b>Bot Live</b> - Scanning for A+, B, and C grade trades.")
-    
-    traded = False
-    while True:
-        now = now_ist()
-        if scan_window_open(now) and not traded:
-            # Silent scan (no prints here)
-            signal = scan_market()
-            if signal:
-                direction = "BUY" if signal["change"] > 0 else "SHORT"
-                atm = round(signal["ltp"] / 50) * 50
-                option = f"{atm} {'CE' if direction == 'BUY' else 'PE'}"
-                
-                emoji = {"A+": "🚀", "B": "⚖️", "C": "⚠️"}.get(signal["grade"], "📈")
-                alert = (f"{emoji} <b>Grade {signal['grade']} Alert</b>\n"
-                         f"<b>Stock:</b> {signal['symbol']}\n"
-                         f"<b>Move:</b> {round(signal['change'], 2)}% (Sec: {round(signal['sec_change'], 2)}%)\n"
-                         f"<b>Option:</b> {option}\n"
-                         f"<b>Note:</b> {signal['grade_desc']}")
-                
-                send(alert)
-                print(f"[{now.strftime('%H:%M')}] Trade Found: {signal['symbol']} ({signal['grade']}). Alert Sent.")
-                traded = True 
 
+    # =====================================================
+    # UPDATED TRADE CONTROL
+    # =====================================================
+    trades_taken = 0
+    MAX_TRADES_PER_DAY = 2
+
+    while True:
+
+        now = now_ist()
+
+        # =====================================================
+        # ACTIVE SCAN WINDOW
+        # =====================================================
+        if scan_window_open(now) and trades_taken < MAX_TRADES_PER_DAY:
+
+            signal = scan_market()
+
+            if signal:
+
+                direction = "BUY" if signal["change"] > 0 else "SHORT"
+
+                atm = round(signal["ltp"] / 50) * 50
+
+                option = f"{atm} {'CE' if direction == 'BUY' else 'PE'}"
+
+                emoji = {
+                    "A+": "🚀",
+                    "B": "⚖️",
+                    "C": "⚠️"
+                }.get(signal["grade"], "📈")
+
+                alert = (
+                    f"{emoji} <b>Grade {signal['grade']} Alert</b>\n"
+                    f"<b>Stock:</b> {signal['symbol']}\n"
+                    f"<b>Move:</b> {round(signal['change'], 2)}% "
+                    f"(Sec: {round(signal['sec_change'], 2)}%)\n"
+                    f"<b>Option:</b> {option}\n"
+                    f"<b>Note:</b> {signal['grade_desc']}"
+                )
+
+                send(alert)
+
+                # =====================================================
+                # UPDATED TRADE COUNTER
+                # =====================================================
+                trades_taken += 1
+
+                print(
+                    f"[{now.strftime('%H:%M')}] "
+                    f"Trade Found: {signal['symbol']} "
+                    f"({signal['grade']}) | "
+                    f"Trade {trades_taken}/{MAX_TRADES_PER_DAY}"
+                )
+
+        # =====================================================
+        # MARKET CLOSE
+        # =====================================================
         if (now.hour == 15 and now.minute >= 30) or now.hour > 15:
+
             send("Market closed - bot stopping.")
+
             break
-        
+
         time.sleep(120)
+
 
 if __name__ == "__main__":
     main()
