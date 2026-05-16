@@ -1,207 +1,234 @@
-
 import os
 import pandas as pd
-import pyotp
-import requests
 from datetime import datetime
 from SmartApi import SmartConnect
-import pytz
-import time
+import pyotp
 
-# =====================================================
-# ENV VARIABLES
-# =====================================================
+# ==============================
+# 🔐 ENV VARIABLES (SECURE)
+# ==============================
 API_KEY     = os.getenv("API_KEY")
 CLIENT_ID   = os.getenv("CLIENT_ID")
 PASSWORD    = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
+
+# (Optional - not used in backtest but kept for consistency)
 TG_TOKEN    = os.getenv("TG_TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
 
-# =====================================================
-# GLOBAL SETTINGS
-# =====================================================
-API_OBJECT = None
-IST        = pytz.timezone("Asia/Kolkata")
-CANDLE_DELAY   = 1.1    
-MAX_RETRIES    = 3      
-RETRY_BACKOFF  = 2.0    
+SYMBOL = "RELIANCE"
+TOKEN  = "2885"
 
-def send(msg):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
-    except Exception as e:
-        pass # Silent failure for Telegram to keep console clean
+# ==============================
+# VALIDATION (IMPORTANT)
+# ==============================
+if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
+    raise ValueError("❌ Missing environment variables. Please set API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET")
 
-def now_ist():
-    return datetime.now(IST)
-
-def is_trading_day():
-    return now_ist().weekday() < 5   
-
-def scan_window_open(now):
-    t = (now.hour, now.minute)
-    return (9, 25) <= t < (15, 25)
-
+# ==============================
+# LOGIN
+# ==============================
 def login():
-    try:
-        obj  = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-        if not data or data.get("status") is False: return None
-        refresh_token = data["data"]["refreshToken"]
-        obj.getfeedToken()
-        obj.generateToken(refresh_token)
-        return obj
-    except:
+    obj = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+
+    if not data or data.get("status") is False:
+        raise Exception(f"Login failed: {data}")
+
+    obj.getfeedToken()
+    return obj
+
+api = login()
+
+# ==============================
+# FETCH DATA
+# ==============================
+def get_data():
+    to_date   = datetime.now().strftime("%Y-%m-%d %H:%M")
+    from_date = (datetime.now() - pd.Timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+
+    data = api.getCandleData({
+        "exchange": "NSE",
+        "symboltoken": TOKEN,
+        "interval": "FIVE_MINUTE",
+        "fromdate": from_date,
+        "todate": to_date
+    })
+
+    df = pd.DataFrame(data["data"],
+        columns=["time","open","high","low","close","volume"]
+    )
+
+    df["time"] = pd.to_datetime(df["time"])
+    return df
+
+# ==============================
+# INDICATORS
+# ==============================
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1/period).mean()
+    avg_loss = loss.ewm(alpha=1/period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
+
+def vol_ratio(df):
+    avg = df["volume"].iloc[:-1].mean()
+    return df["volume"].iloc[-1] / avg if avg > 0 else 0
+
+def calc_atr(df, period=14):
+    high = df["high"]
+    low  = df["low"]
+    close = df["close"]
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    return tr.rolling(period).mean().iloc[-1]
+
+# ==============================
+# STRATEGY LOGIC
+# ==============================
+def breakout_signal(df):
+    if len(df) < 5:
         return None
 
-# =====================================================
-# SECTOR MAP
-# =====================================================
-SECTORS = {
-    "BANK": {"HDFCBANK": "1333", "ICICIBANK": "4963", "SBIN": "3045", "AXISBANK": "5900", "KOTAKBANK": "1922"},
-    "IT": {"TCS": "11536", "INFY": "1594", "HCLTECH": "7229", "TECHM": "13538", "WIPRO": "3787"},
-    "AUTO": {"TATAMOTORS": "3456", "MARUTI": "10999", "M&M": "2031", "BAJAJ-AUTO": "16669"},
-    "PHARMA": {"SUNPHARMA": "3351", "CIPLA": "694", "DRREDDY": "881", "DIVISLAB": "10940"},
-    "FMCG": {"ITC": "1660", "HINDUNILVR": "1394", "NESTLEIND": "17963"},
-    "METAL": {"TATASTEEL": "3499", "JSWSTEEL": "11723", "HINDALCO": "1363"},
-    "ENERGY": {"RELIANCE": "2885", "ONGC": "2475", "NTPC": "11630", "POWERGRID": "14977"},
-    "NBFC": {"BAJFINANCE": "317", "BAJAJFINSV": "16675"},
-    "INFRA": {"LT": "11483", "ADANIPORTS": "15083"},
-}
+    prev_high = df["high"].iloc[-2]
+    prev_low  = df["low"].iloc[-2]
+    close     = df["close"].iloc[-1]
 
-def get_data(token):
-    global API_OBJECT
-    now = now_ist()
-    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    from_str, to_str = start.strftime("%Y-%m-%d %H:%M"), now.strftime("%Y-%m-%d %H:%M")
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            res = API_OBJECT.getCandleData({"exchange": "NSE", "symboltoken": token, "interval": "FIVE_MINUTE", "fromdate": from_str, "todate": to_str})
-            if res and res.get("data"):
-                return pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-            if res and res.get("errorCode") == "AG8001":
-                API_OBJECT = login()
-            time.sleep(RETRY_BACKOFF)
-        except:
+    if close > prev_high:
+        return "BUY"
+    elif close < prev_low:
+        return "SHORT"
+    return None
+
+def strong_candle(df):
+    c = df.iloc[-1]
+    body = abs(c["close"] - c["open"])
+    rng  = c["high"] - c["low"]
+
+    if rng == 0:
+        return False
+
+    return (body / rng) > 0.6
+
+def rsi_momentum(rsi, direction):
+    if direction == "BUY":
+        return 55 < rsi < 75
+    else:
+        return 25 < rsi < 45
+
+def get_entry(df, direction):
+    return df["high"].iloc[-2] if direction == "BUY" else df["low"].iloc[-2]
+
+def build_sl_target(entry, direction, atr):
+    if pd.isna(atr) or atr == 0:
+        sl_pct = 0.3
+        tgt_pct = 0.6
+    else:
+        sl_pct = (1.2 * atr / entry) * 100
+        tgt_pct = (2.5 * atr / entry) * 100
+
+    if direction == "BUY":
+        sl = entry * (1 - sl_pct/100)
+        target = entry * (1 + tgt_pct/100)
+    else:
+        sl = entry * (1 + sl_pct/100)
+        target = entry * (1 - tgt_pct/100)
+
+    return sl, target
+
+# ==============================
+# BACKTEST
+# ==============================
+def backtest():
+    df = get_data()
+
+    trades = []
+    balance = 10000
+
+    for i in range(30, len(df)-1):
+        sub_df = df.iloc[:i+1]
+
+        signal = breakout_signal(sub_df)
+        if not signal:
             continue
-    return pd.DataFrame()
 
-def grade_trade(stock_pct, sector_pct):
-    s_chg, sec_chg = abs(stock_pct), abs(sector_pct)
-    if s_chg >= 1.50 and sec_chg >= 0.75: return "A+", "High Recommendation (Strong Momentum)", 3
-    if s_chg >= 0.75 and sec_chg >= 0.40: return "B", "Good Setup (Human Logic & Chart Check Advised)", 2
-    if s_chg >= 0.25 and sec_chg >= 0.20: return "C", "Borderline Setup (Strict Human Logic Required)", 1
-    return "D", None, 0
+        rsi = calc_rsi(sub_df["close"]).iloc[-1]
+        vol = vol_ratio(sub_df)
 
-def scan_market():
-    market_data, sector_raw = [], {}
-    for sector, stocks in SECTORS.items():
-        for symbol, token in stocks.items():
-            df = get_data(token)
-            if len(df) < 4 or df.iloc[0]["open"] == 0:
-                time.sleep(CANDLE_DELAY)
-                continue
-            change_pct = ((df.iloc[-1]["close"] - df.iloc[0]["open"]) / df.iloc[0]["open"]) * 100
-            sector_raw.setdefault(sector, []).append(change_pct)
-            market_data.append({"symbol": symbol, "sector": sector, "change": change_pct, "ltp": df.iloc[-1]["close"]})
-            time.sleep(CANDLE_DELAY)
+        if vol < 2.5:
+            continue
 
-    if not market_data: return None
-    sector_avg = {s: sum(v) / len(v) for s, v in sector_raw.items()}
-    graded = []
-    for s in market_data:
-        grade, desc, rank = grade_trade(s["change"], sector_avg.get(s["sector"], 0))
-        if rank > 0:
-            s.update({"grade": grade, "grade_desc": desc, "rank": rank, "sec_change": sector_avg[s["sector"]]})
-            graded.append(s)
-    
-    if not graded: return None
-    graded.sort(key=lambda x: (x["rank"], abs(x["change"])), reverse=True)
-    return graded[0]
+        if not rsi_momentum(rsi, signal):
+            continue
 
-def main():
-    global API_OBJECT
+        if not strong_candle(sub_df):
+            continue
 
-    if not is_trading_day():
-        return
+        entry = get_entry(sub_df, signal)
+        atr   = calc_atr(sub_df)
 
-    API_OBJECT = login()
+        sl, target = build_sl_target(entry, signal, atr)
 
-    if not API_OBJECT:
-        return
+        next_candle = df.iloc[i+1]
 
-    # Startup message
-    print(f"[{now_ist().strftime('%H:%M')}] Bot is live and scanning silently...")
-    send("<b>Bot Live</b> - Scanning for A+, B, and C grade trades.")
+        result = None
+        pnl = 0
 
-    # =====================================================
-    # UPDATED TRADE CONTROL
-    # =====================================================
-    trades_taken = 0
-    MAX_TRADES_PER_DAY = 2
+        if signal == "BUY":
+            if next_candle["low"] <= sl:
+                result = "LOSS"
+                pnl = -1
+            elif next_candle["high"] >= target:
+                result = "WIN"
+                pnl = 2.5
+        else:
+            if next_candle["high"] >= sl:
+                result = "LOSS"
+                pnl = -1
+            elif next_candle["low"] <= target:
+                result = "WIN"
+                pnl = 2.5
 
-    while True:
+        if result:
+            balance *= (1 + pnl/100)
 
-        now = now_ist()
+            trades.append({
+                "time": df.iloc[i]["time"],
+                "signal": signal,
+                "entry": entry,
+                "result": result,
+                "pnl%": pnl,
+                "balance": balance
+            })
 
-        # =====================================================
-        # ACTIVE SCAN WINDOW
-        # =====================================================
-        if scan_window_open(now) and trades_taken < MAX_TRADES_PER_DAY:
+    total = len(trades)
+    wins  = len([t for t in trades if t["result"] == "WIN"])
 
-            signal = scan_market()
+    win_rate = (wins / total * 100) if total > 0 else 0
 
-            if signal:
+    print("\n========== BACKTEST RESULT ==========")
+    print("Total Trades :", total)
+    print("Win Rate     :", round(win_rate, 2), "%")
+    print("Final Balance:", round(balance, 2))
+    print("====================================")
 
-                direction = "BUY" if signal["change"] > 0 else "SHORT"
+    return pd.DataFrame(trades)
 
-                atm = round(signal["ltp"] / 50) * 50
-
-                option = f"{atm} {'CE' if direction == 'BUY' else 'PE'}"
-
-                emoji = {
-                    "A+": "🚀",
-                    "B": "⚖️",
-                    "C": "⚠️"
-                }.get(signal["grade"], "📈")
-
-                alert = (
-                    f"{emoji} <b>Grade {signal['grade']} Alert</b>\n"
-                    f"<b>Stock:</b> {signal['symbol']}\n"
-                    f"<b>Move:</b> {round(signal['change'], 2)}% "
-                    f"(Sec: {round(signal['sec_change'], 2)}%)\n"
-                    f"<b>Option:</b> {option}\n"
-                    f"<b>Note:</b> {signal['grade_desc']}"
-                )
-
-                send(alert)
-
-                # =====================================================
-                # UPDATED TRADE COUNTER
-                # =====================================================
-                trades_taken += 1
-
-                print(
-                    f"[{now.strftime('%H:%M')}] "
-                    f"Trade Found: {signal['symbol']} "
-                    f"({signal['grade']}) | "
-                    f"Trade {trades_taken}/{MAX_TRADES_PER_DAY}"
-                )
-
-        # =====================================================
-        # MARKET CLOSE
-        # =====================================================
-        if (now.hour == 15 and now.minute >= 30) or now.hour > 15:
-
-            send("Market closed - bot stopping.")
-
-            break
-
-        time.sleep(120)
-
-
+# ==============================
+# RUN
+# ==============================
 if __name__ == "__main__":
-    main()
+    df = backtest()
+    df.to_excel("backtest_results.xlsx", index=False)
+    print("✅ Saved: backtest_results.xlsx")
