@@ -5,25 +5,21 @@ from SmartApi import SmartConnect
 import pyotp
 
 # ==============================
-# 🔐 ENV VARIABLES (SECURE)
+# 🔐 ENV VARIABLES
 # ==============================
 API_KEY     = os.getenv("API_KEY")
 CLIENT_ID   = os.getenv("CLIENT_ID")
 PASSWORD    = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
 
-# (Optional - not used in backtest but kept for consistency)
-TG_TOKEN    = os.getenv("TG_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
-
 SYMBOL = "RELIANCE"
 TOKEN  = "2885"
 
 # ==============================
-# VALIDATION (IMPORTANT)
+# VALIDATION
 # ==============================
 if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
-    raise ValueError("❌ Missing environment variables. Please set API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET")
+    raise ValueError("❌ Missing environment variables")
 
 # ==============================
 # LOGIN
@@ -95,7 +91,7 @@ def calc_atr(df, period=14):
     return tr.rolling(period).mean().iloc[-1]
 
 # ==============================
-# STRATEGY LOGIC
+# STRATEGY LOGIC (v7)
 # ==============================
 def breakout_signal(df):
     if len(df) < 5:
@@ -148,7 +144,7 @@ def build_sl_target(entry, direction, atr):
     return sl, target
 
 # ==============================
-# BACKTEST
+# BACKTEST ENGINE
 # ==============================
 def backtest():
     df = get_data()
@@ -205,22 +201,29 @@ def backtest():
 
             trades.append({
                 "time": df.iloc[i]["time"],
+                "symbol": SYMBOL,
                 "signal": signal,
-                "entry": entry,
+                "entry": round(entry,2),
+                "sl": round(sl,2),
+                "target": round(target,2),
                 "result": result,
                 "pnl%": pnl,
-                "balance": balance
+                "balance": round(balance,2)
             })
 
     total = len(trades)
     wins  = len([t for t in trades if t["result"] == "WIN"])
+    losses = len([t for t in trades if t["result"] == "LOSS"])
 
     win_rate = (wins / total * 100) if total > 0 else 0
 
     print("\n========== BACKTEST RESULT ==========")
-    print("Total Trades :", total)
-    print("Win Rate     :", round(win_rate, 2), "%")
-    print("Final Balance:", round(balance, 2))
+    print("Symbol        :", SYMBOL)
+    print("Total Trades  :", total)
+    print("Wins          :", wins)
+    print("Losses        :", losses)
+    print("Win Rate      :", round(win_rate, 2), "%")
+    print("Final Balance :", round(balance, 2))
     print("====================================")
 
     return pd.DataFrame(trades)
@@ -230,5 +233,11 @@ def backtest():
 # ==============================
 if __name__ == "__main__":
     df = backtest()
-    df.to_excel("backtest_results.xlsx", index=False)
-    print("✅ Saved: backtest_results.xlsx")
+
+    # Save results (safe export)
+    try:
+        df.to_excel("backtest_results.xlsx", index=False)
+        print("✅ Saved: backtest_results.xlsx")
+    except Exception:
+        df.to_csv("backtest_results.csv", index=False)
+        print("⚠️ Excel not available → Saved CSV instead")
